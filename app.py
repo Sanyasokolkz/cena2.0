@@ -1,6 +1,5 @@
-# app.py - API для Railway + n8n со структурированными JSON данными
+# app.py - API с резервным алгоритмом
 import os
-import pickle
 import pandas as pd
 import numpy as np
 import re
@@ -12,95 +11,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-# Глобальная переменная для модели
-model_artifacts = None
-
-def load_model():
-    """Загружает модель при старте приложения"""
-    global model_artifacts
-    
-    # Список возможных путей к модели
-    possible_paths = [
-        'solana_token_xgboost_model.pkl',
-        './solana_token_xgboost_model.pkl',
-        '/app/solana_token_xgboost_model.pkl',
-        os.path.join(os.getcwd(), 'solana_token_xgboost_model.pkl')
-    ]
-    
-    logger.info(f"🔍 Текущая директория: {os.getcwd()}")
-    logger.info(f"📁 Файлы в директории: {os.listdir('.')}")
-    
-    model_file = None
-    for path in possible_paths:
-        logger.info(f"🔍 Проверяем путь: {path}")
-        if os.path.exists(path):
-            model_file = path
-            logger.info(f"✅ Найден файл модели: {path}")
-            # Проверяем размер файла
-            file_size = os.path.getsize(path)
-            logger.info(f"📏 Размер файла: {file_size} bytes ({file_size/1024/1024:.2f} MB)")
-            break
-        else:
-            logger.info(f"❌ Файл не найден: {path}")
-    
-    if not model_file:
-        logger.error("❌ Файл модели не найден ни в одном из путей!")
-        logger.error("📂 Доступные файлы:")
-        for file in os.listdir('.'):
-            logger.error(f"   - {file}")
-        return False
-    
-    try:
-        logger.info("🔄 Начинаем загрузку модели...")
-        
-        # Пробуем разные способы загрузки
-        try:
-            # Стандартный способ
-            with open(model_file, 'rb') as f:
-                model_artifacts = pickle.load(f)
-            logger.info("✅ Модель загружена стандартным способом")
-        except Exception as e1:
-            logger.warning(f"⚠️ Стандартная загрузка не удалась: {e1}")
-            try:
-                # Пробуем с joblib
-                import joblib
-                model_artifacts = joblib.load(model_file)
-                logger.info("✅ Модель загружена через joblib")
-            except Exception as e2:
-                logger.error(f"❌ Загрузка через joblib не удалась: {e2}")
-                raise e1  # Возвращаем первую ошибку
-        
-        # Проверяем структуру модели
-        if not isinstance(model_artifacts, dict):
-            logger.error(f"❌ Неожиданный тип модели: {type(model_artifacts)}")
-            return False
-            
-        required_keys = ['model', 'feature_names', 'imputer', 'performance_metrics']
-        missing_keys = [key for key in required_keys if key not in model_artifacts]
-        
-        if missing_keys:
-            logger.error(f"❌ В модели отсутствуют ключи: {missing_keys}")
-            logger.error(f"📋 Доступные ключи: {list(model_artifacts.keys())}")
-            return False
-        
-        # Проверяем типы данных
-        logger.info(f"🔍 Тип модели: {type(model_artifacts['model'])}")
-        logger.info(f"🔍 Тип импутера: {type(model_artifacts['imputer'])}")
-        logger.info(f"🔍 Количество признаков: {len(model_artifacts['feature_names'])}")
-        
-        logger.info(f"✅ Модель успешно загружена!")
-        logger.info(f"📊 AUC: {model_artifacts['performance_metrics']['test_auc']:.4f}")
-        logger.info(f"🔢 Количество признаков: {len(model_artifacts['feature_names'])}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка загрузки модели: {e}")
-        logger.error(f"❌ Тип ошибки: {type(e).__name__}")
-        import traceback
-        logger.error(f"❌ Трейсбек: {traceback.format_exc()}")
-        return False
 
 def parse_value_with_suffix(value_str):
     """Парсит строковые значения с суффиксами K, M, B"""
@@ -129,7 +39,6 @@ def parse_token_age_minutes(token_age_str):
     if not token_age_str:
         return 0
     
-    # Извлекаем число и единицу измерения
     match = re.match(r'(\d+)([mhd]?)', str(token_age_str))
     if not match:
         return 0
@@ -137,11 +46,11 @@ def parse_token_age_minutes(token_age_str):
     value = int(match.group(1))
     unit = match.group(2)
     
-    if unit == 'm' or unit == '':  # минуты
+    if unit == 'm' or unit == '':
         return value
-    elif unit == 'h':  # часы
+    elif unit == 'h':
         return value * 60
-    elif unit == 'd':  # дни
+    elif unit == 'd':
         return value * 60 * 24
     else:
         return value
@@ -260,33 +169,95 @@ def process_token_data(token_json):
         logger.error(f"❌ Ошибка обработки данных: {e}")
         raise ValueError(f"Ошибка обработки данных токена: {e}")
 
-def predict_token_success(token_data):
-    """Функция предсказания успешности токена"""
-    
-    if model_artifacts is None:
-        raise ValueError("Модель не загружена")
+def predict_token_success_fallback(token_data):
+    """Резервный алгоритм предсказания без ML модели"""
     
     try:
-        # Создаем DataFrame из входных данных
-        df_new = pd.DataFrame([token_data])
+        # Извлекаем ключевые метрики
+        market_cap = token_data.get('market_cap', 0)
+        liquidity = token_data.get('liquidity', 0)
+        volume_1m = token_data.get('volume_1m', 0)
+        buyers_green = token_data.get('buyers_green', 0)
+        buyers_red = token_data.get('buyers_red', 0)
+        buyers_blue = token_data.get('buyers_blue', 0)
+        buyers_clown = token_data.get('buyers_clown', 0)
+        buyers_sun = token_data.get('buyers_sun', 0)
+        top_10_percent = token_data.get('top_10_percent', 0)
+        dev_balance = token_data.get('dev_current_balance_percent', 0)
+        security_score = (token_data.get('security_no_mint', 0) + 
+                         token_data.get('security_burnt', 0) + 
+                         token_data.get('security_dev_sold', 0))
         
-        # Добавляем недостающие столбцы с нулевыми значениями
-        for col in model_artifacts['feature_names']:
-            if col not in df_new.columns:
-                df_new[col] = 0
+        # Система скоринга
+        score = 0
         
-        # Упорядочиваем столбцы
-        df_new = df_new[model_artifacts['feature_names']]
+        # 1. Рыночная капитализация (0-20 баллов)
+        if market_cap >= 1000000:  # >= 1M
+            score += 20
+        elif market_cap >= 500000:  # >= 500K
+            score += 15
+        elif market_cap >= 100000:  # >= 100K
+            score += 10
+        elif market_cap >= 50000:   # >= 50K
+            score += 5
         
-        # Применяем импутер
-        df_imputed = pd.DataFrame(
-            model_artifacts['imputer'].transform(df_new), 
-            columns=model_artifacts['feature_names']
-        )
+        # 2. Ликвидность (0-20 баллов)
+        if liquidity >= 500000:  # >= 500K
+            score += 20
+        elif liquidity >= 200000:  # >= 200K
+            score += 15
+        elif liquidity >= 100000:  # >= 100K
+            score += 10
+        elif liquidity >= 50000:   # >= 50K
+            score += 5
         
-        # Получаем предсказания
-        prediction = model_artifacts['model'].predict(df_imputed)[0]
-        probability = model_artifacts['model'].predict_proba(df_imputed)[0, 1]
+        # 3. Объем торгов (0-15 баллов)
+        if volume_1m >= 100000:  # >= 100K
+            score += 15
+        elif volume_1m >= 50000:  # >= 50K
+            score += 10
+        elif volume_1m >= 20000:  # >= 20K
+            score += 5
+        
+        # 4. Поведение покупателей (0-25 баллов)
+        positive_buyers = buyers_green + buyers_blue + buyers_clown + buyers_sun
+        negative_buyers = buyers_red
+        
+        if positive_buyers > 0:
+            buyer_ratio = positive_buyers / max(negative_buyers, 1)
+            if buyer_ratio >= 3:
+                score += 25
+            elif buyer_ratio >= 2:
+                score += 20
+            elif buyer_ratio >= 1.5:
+                score += 15
+            elif buyer_ratio >= 1:
+                score += 10
+            else:
+                score += 5
+        
+        # 5. Концентрация токенов (0-10 баллов)
+        if top_10_percent <= 30:
+            score += 10
+        elif top_10_percent <= 50:
+            score += 7
+        elif top_10_percent <= 70:
+            score += 5
+        
+        # 6. Разработчик (0-5 баллов)
+        if dev_balance <= 5:
+            score += 5
+        elif dev_balance <= 15:
+            score += 3
+        
+        # 7. Безопасность (0-5 баллов)
+        score += security_score
+        
+        # Нормализуем до вероятности (0-1)
+        probability = min(score / 100.0, 1.0)
+        
+        # Определяем предсказание
+        prediction = 1 if probability >= 0.5 else 0
         
         # Определяем уверенность
         confidence_score = abs(probability - 0.5) * 2
@@ -299,7 +270,6 @@ def predict_token_success(token_data):
         else:
             confidence_level = "low"
         
-        # Формируем результат
         result = {
             'prediction': 'success' if prediction == 1 else 'fail',
             'binary_prediction': int(prediction),
@@ -307,7 +277,18 @@ def predict_token_success(token_data):
             'probability_percent': round(probability * 100, 1),
             'confidence_score': round(confidence_score, 4),
             'confidence_level': confidence_level,
-            'expected_pnl': 'PNL >= 2x' if prediction == 1 else 'PNL < 2x'
+            'expected_pnl': 'PNL >= 2x' if prediction == 1 else 'PNL < 2x',
+            'algorithm': 'fallback_heuristic',
+            'score_breakdown': {
+                'market_cap_score': min(20, max(0, (market_cap / 50000) * 5)),
+                'liquidity_score': min(20, max(0, (liquidity / 50000) * 5)),
+                'volume_score': min(15, max(0, (volume_1m / 20000) * 5)),
+                'buyer_ratio_score': min(25, max(0, score - 60)) if score >= 60 else 0,
+                'concentration_score': 10 if top_10_percent <= 30 else (7 if top_10_percent <= 50 else 5),
+                'dev_score': 5 if dev_balance <= 5 else 3,
+                'security_score': security_score,
+                'total_score': score
+            }
         }
         
         return result
@@ -435,13 +416,12 @@ def home():
     return jsonify({
         'service': 'Solana Token Predictor API',
         'status': 'online',
-        'model_loaded': model_artifacts is not None,
+        'algorithm': 'fallback_heuristic',
+        'note': 'Using fallback algorithm due to ML model loading issues',
         'endpoints': {
             'predict': '/predict [POST]',
             'predict_batch': '/predict-batch [POST]',
             'health': '/health [GET]',
-            'model_info': '/model-info [GET]',
-            'reload_model': '/reload-model [POST]',
             'example': '/example [GET]'
         }
     })
@@ -449,19 +429,6 @@ def home():
 @app.route('/predict', methods=['POST'])
 def predict():
     """Основной endpoint для предсказания одного токена"""
-    
-    # Подробная диагностика состояния модели
-    if model_artifacts is None:
-        logger.error("❌ Модель не загружена при обращении к /predict")
-        return jsonify({
-            'success': False,
-            'error': 'Model not loaded',
-            'debug_info': {
-                'current_directory': os.getcwd(),
-                'files_in_directory': os.listdir('.'),
-                'model_artifacts_status': 'None'
-            }
-        }), 500
     
     try:
         # Получаем JSON данные
@@ -493,8 +460,8 @@ def predict():
         # Обрабатываем JSON данные токена
         processed_token_data = process_token_data(token_json)
         
-        # Делаем предсказание
-        prediction_result = predict_token_success(processed_token_data)
+        # Делаем предсказание (используем fallback алгоритм)
+        prediction_result = predict_token_success_fallback(processed_token_data)
         
         # Анализируем сигналы
         signals = analyze_token_signals(processed_token_data)
@@ -514,6 +481,10 @@ def predict():
             'signals': signals,
             'safety': safety,
             'recommendation': recommendation,
+            'algorithm_info': {
+                'type': 'fallback_heuristic',
+                'note': 'Using rule-based algorithm instead of ML model'
+            },
             'timestamp': pd.Timestamp.now().isoformat()
         }
         
@@ -532,12 +503,6 @@ def predict():
 @app.route('/predict-batch', methods=['POST'])
 def predict_batch():
     """Endpoint для пакетного предсказания нескольких токенов"""
-    
-    if model_artifacts is None:
-        return jsonify({
-            'success': False,
-            'error': 'Model not loaded'
-        }), 500
     
     try:
         # Получаем JSON данные
@@ -568,7 +533,7 @@ def predict_batch():
             try:
                 # Обрабатываем каждый токен
                 processed_token_data = process_token_data(token_json)
-                prediction_result = predict_token_success(processed_token_data)
+                prediction_result = predict_token_success_fallback(processed_token_data)
                 signals = analyze_token_signals(processed_token_data)
                 safety = check_token_safety(processed_token_data)
                 recommendation = get_recommendation(prediction_result, signals, safety)
@@ -604,6 +569,10 @@ def predict_batch():
             'successful_predictions': successful,
             'failed_predictions': failed,
             'results': results,
+            'algorithm_info': {
+                'type': 'fallback_heuristic',
+                'note': 'Using rule-based algorithm instead of ML model'
+            },
             'timestamp': pd.Timestamp.now().isoformat()
         }
         
@@ -622,100 +591,26 @@ def predict_batch():
 def health():
     """Health check для Railway"""
     
-    model_info = {}
-    model_status = "not_loaded"
-    
-    if model_artifacts:
-        model_status = "loaded"
-        try:
-            model_info = {
-                'auc': model_artifacts['performance_metrics']['test_auc'],
-                'f1': model_artifacts['performance_metrics']['test_f1'],
-                'features_count': len(model_artifacts['feature_names'])
-            }
-        except Exception as e:
-            model_status = "loaded_but_corrupted"
-            model_info = {'error': str(e)}
-    
     return jsonify({
         'status': 'healthy',
-        'model_status': model_status,
-        'model_loaded': model_artifacts is not None,
-        'model_info': model_info,
-        'debug_info': {
-            'current_directory': os.getcwd(),
-            'files_in_directory': os.listdir('.'),
-            'python_version': f"{pd.__version__}",
-            'pandas_version': f"{np.__version__}"
-        },
+        'algorithm': 'fallback_heuristic',
+        'model_status': 'fallback_mode',
+        'note': 'API working with rule-based algorithm',
         'timestamp': pd.Timestamp.now().isoformat()
     })
 
-@app.route('/model-info', methods=['GET'])
-def model_info():
-    """Информация о модели"""
-    
-    if model_artifacts is None:
-        return jsonify({
-            'success': False,
-            'error': 'Model not loaded'
-        }), 500
-    
-    # Топ-10 важных признаков
-    top_features = model_artifacts['feature_importance'].head(10).to_dict('records')
-    
-    return jsonify({
-        'success': True,
-        'model_type': model_artifacts.get('model_type', 'Unknown'),
-        'training_approach': model_artifacts.get('training_approach', 'Unknown'),
-        'performance_metrics': model_artifacts['performance_metrics'],
-        'features_count': len(model_artifacts['feature_names']),
-        'top_features': top_features,
-        'all_features': model_artifacts['feature_names']
-    })
-
-@app.route('/reload-model', methods=['POST'])
-def reload_model():
-    """Принудительная перезагрузка модели"""
-    
-    logger.info("🔄 Попытка перезагрузки модели...")
-    
-    model_loaded = load_model()
-    
-    if model_loaded:
-        return jsonify({
-            'success': True,
-            'message': 'Model reloaded successfully',
-            'model_info': {
-                'auc': model_artifacts['performance_metrics']['test_auc'],
-                'f1': model_artifacts['performance_metrics']['test_f1'],
-                'features_count': len(model_artifacts['feature_names'])
-            }
-        })
-    else:
-        return jsonify({
-            'success': False,
-            'error': 'Failed to reload model',
-            'debug_info': {
-                'current_directory': os.getcwd(),
-                'files_in_directory': os.listdir('.')
-            }
-        }), 500
+@app.route('/example', methods=['GET'])
 def example():
     """Пример входных данных в структурированном JSON формате"""
     
     example_data = {
         "symbol": "CRUMB",
         "name": "Crumbcat",
-        "contract_address": "Hz7MeU72BNF9rCWyUFAwKTyCcjr6qsJm1jwYehnqjups",
         "token_age": "2m",
-        "views": 59,
         "market_cap": "129.1K",
         "liquidity": "47.3K",
         "sol_pooled": None,
         "ath": "152.7K",
-        "ath_change_percent": -21,
-        "ath_time_ago": "32s",
         "volume_1m": 148947.33,
         "buy_volume_1m": 81396.06,
         "sell_volume_1m": 67551.28,
@@ -744,7 +639,7 @@ def example():
         "freshies_1d_percent": 5.5,
         "freshies_7d_percent": 18,
         "top_10_percent": 21,
-        "top_10_holdings": [29.2, 3.38, 3.32, 2.96, 2.95, 2.56, 2.49, 2.26, 1.95, 1.89],
+        "top_10_holdings": [29.2, 3.38, 3.32, 2.96, 2.95],
         "dev_current_balance_percent": 0,
         "dev_sol_balance": 0.225,
         "security": {
@@ -765,21 +660,13 @@ def example():
             },
             'body': example_data
         },
-        'array_request': {
-            'url': request.base_url.replace('/example', '/predict'),
-            'method': 'POST',
-            'headers': {
-                'Content-Type': 'application/json'
-            },
-            'body': [example_data]
-        },
         'batch_request': {
             'url': request.base_url.replace('/example', '/predict-batch'),
             'method': 'POST',
             'headers': {
                 'Content-Type': 'application/json'
             },
-            'body': [example_data, example_data]
+            'body': [example_data]
         }
     })
 
@@ -789,7 +676,7 @@ def not_found(error):
     return jsonify({
         'success': False,
         'error': 'Endpoint not found',
-        'available_endpoints': ['/predict', '/predict-batch', '/health', '/model-info', '/example']
+        'available_endpoints': ['/predict', '/predict-batch', '/health', '/example']
     }), 404
 
 @app.errorhandler(500)
@@ -801,14 +688,7 @@ def internal_error(error):
 
 # Запуск приложения
 if __name__ == '__main__':
-    # Загружаем модель при старте
-    logger.info("🚀 Запуск приложения...")
-    model_loaded = load_model()
-    
-    if model_loaded:
-        logger.info("✅ Модель успешно загружена, API готов к работе!")
-    else:
-        logger.warning("⚠️ Модель не загружена, но API запустится в режиме диагностики")
+    logger.info("🚀 Запуск API с резервным алгоритмом...")
     
     # Получаем порт из переменной окружения (Railway)
     port = int(os.environ.get('PORT', 5000))
