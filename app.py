@@ -37,6 +37,9 @@ def load_model():
         if os.path.exists(path):
             model_file = path
             logger.info(f"✅ Найден файл модели: {path}")
+            # Проверяем размер файла
+            file_size = os.path.getsize(path)
+            logger.info(f"📏 Размер файла: {file_size} bytes ({file_size/1024/1024:.2f} MB)")
             break
         else:
             logger.info(f"❌ Файл не найден: {path}")
@@ -49,16 +52,42 @@ def load_model():
         return False
     
     try:
-        with open(model_file, 'rb') as f:
-            model_artifacts = pickle.load(f)
+        logger.info("🔄 Начинаем загрузку модели...")
+        
+        # Пробуем разные способы загрузки
+        try:
+            # Стандартный способ
+            with open(model_file, 'rb') as f:
+                model_artifacts = pickle.load(f)
+            logger.info("✅ Модель загружена стандартным способом")
+        except Exception as e1:
+            logger.warning(f"⚠️ Стандартная загрузка не удалась: {e1}")
+            try:
+                # Пробуем с joblib
+                import joblib
+                model_artifacts = joblib.load(model_file)
+                logger.info("✅ Модель загружена через joblib")
+            except Exception as e2:
+                logger.error(f"❌ Загрузка через joblib не удалась: {e2}")
+                raise e1  # Возвращаем первую ошибку
         
         # Проверяем структуру модели
+        if not isinstance(model_artifacts, dict):
+            logger.error(f"❌ Неожиданный тип модели: {type(model_artifacts)}")
+            return False
+            
         required_keys = ['model', 'feature_names', 'imputer', 'performance_metrics']
         missing_keys = [key for key in required_keys if key not in model_artifacts]
         
         if missing_keys:
             logger.error(f"❌ В модели отсутствуют ключи: {missing_keys}")
+            logger.error(f"📋 Доступные ключи: {list(model_artifacts.keys())}")
             return False
+        
+        # Проверяем типы данных
+        logger.info(f"🔍 Тип модели: {type(model_artifacts['model'])}")
+        logger.info(f"🔍 Тип импутера: {type(model_artifacts['imputer'])}")
+        logger.info(f"🔍 Количество признаков: {len(model_artifacts['feature_names'])}")
         
         logger.info(f"✅ Модель успешно загружена!")
         logger.info(f"📊 AUC: {model_artifacts['performance_metrics']['test_auc']:.4f}")
@@ -69,6 +98,8 @@ def load_model():
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки модели: {e}")
         logger.error(f"❌ Тип ошибки: {type(e).__name__}")
+        import traceback
+        logger.error(f"❌ Трейсбек: {traceback.format_exc()}")
         return False
 
 def parse_value_with_suffix(value_str):
