@@ -19,18 +19,56 @@ model_artifacts = None
 def load_model():
     """Загружает модель при старте приложения"""
     global model_artifacts
-    try:
-        model_file = 'solana_token_xgboost_model.pkl'
-        if os.path.exists(model_file):
-            with open(model_file, 'rb') as f:
-                model_artifacts = pickle.load(f)
-            logger.info(f"✅ Модель загружена! AUC: {model_artifacts['performance_metrics']['test_auc']:.4f}")
-            return True
+    
+    # Список возможных путей к модели
+    possible_paths = [
+        'solana_token_xgboost_model.pkl',
+        './solana_token_xgboost_model.pkl',
+        '/app/solana_token_xgboost_model.pkl',
+        os.path.join(os.getcwd(), 'solana_token_xgboost_model.pkl')
+    ]
+    
+    logger.info(f"🔍 Текущая директория: {os.getcwd()}")
+    logger.info(f"📁 Файлы в директории: {os.listdir('.')}")
+    
+    model_file = None
+    for path in possible_paths:
+        logger.info(f"🔍 Проверяем путь: {path}")
+        if os.path.exists(path):
+            model_file = path
+            logger.info(f"✅ Найден файл модели: {path}")
+            break
         else:
-            logger.error(f"❌ Файл модели {model_file} не найден")
+            logger.info(f"❌ Файл не найден: {path}")
+    
+    if not model_file:
+        logger.error("❌ Файл модели не найден ни в одном из путей!")
+        logger.error("📂 Доступные файлы:")
+        for file in os.listdir('.'):
+            logger.error(f"   - {file}")
+        return False
+    
+    try:
+        with open(model_file, 'rb') as f:
+            model_artifacts = pickle.load(f)
+        
+        # Проверяем структуру модели
+        required_keys = ['model', 'feature_names', 'imputer', 'performance_metrics']
+        missing_keys = [key for key in required_keys if key not in model_artifacts]
+        
+        if missing_keys:
+            logger.error(f"❌ В модели отсутствуют ключи: {missing_keys}")
             return False
+        
+        logger.info(f"✅ Модель успешно загружена!")
+        logger.info(f"📊 AUC: {model_artifacts['performance_metrics']['test_auc']:.4f}")
+        logger.info(f"🔢 Количество признаков: {len(model_artifacts['feature_names'])}")
+        
+        return True
+        
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки модели: {e}")
+        logger.error(f"❌ Тип ошибки: {type(e).__name__}")
         return False
 
 def parse_value_with_suffix(value_str):
@@ -371,7 +409,9 @@ def home():
             'predict': '/predict [POST]',
             'predict_batch': '/predict-batch [POST]',
             'health': '/health [GET]',
-            'model_info': '/model-info [GET]'
+            'model_info': '/model-info [GET]',
+            'reload_model': '/reload-model [POST]',
+            'example': '/example [GET]'
         }
     })
 
@@ -379,10 +419,17 @@ def home():
 def predict():
     """Основной endpoint для предсказания одного токена"""
     
+    # Подробная диагностика состояния модели
     if model_artifacts is None:
+        logger.error("❌ Модель не загружена при обращении к /predict")
         return jsonify({
             'success': False,
-            'error': 'Model not loaded'
+            'error': 'Model not loaded',
+            'debug_info': {
+                'current_directory': os.getcwd(),
+                'files_in_directory': os.listdir('.'),
+                'model_artifacts_status': 'None'
+            }
         }), 500
     
     try:
@@ -447,7 +494,8 @@ def predict():
         logger.error(f"❌ Ошибка API: {e}")
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'error_type': type(e).__name__
         }), 500
 
 @app.route('/predict-batch', methods=['POST'])
@@ -544,17 +592,31 @@ def health():
     """Health check для Railway"""
     
     model_info = {}
+    model_status = "not_loaded"
+    
     if model_artifacts:
-        model_info = {
-            'auc': model_artifacts['performance_metrics']['test_auc'],
-            'f1': model_artifacts['performance_metrics']['test_f1'],
-            'features_count': len(model_artifacts['feature_names'])
-        }
+        model_status = "loaded"
+        try:
+            model_info = {
+                'auc': model_artifacts['performance_metrics']['test_auc'],
+                'f1': model_artifacts['performance_metrics']['test_f1'],
+                'features_count': len(model_artifacts['feature_names'])
+            }
+        except Exception as e:
+            model_status = "loaded_but_corrupted"
+            model_info = {'error': str(e)}
     
     return jsonify({
         'status': 'healthy',
+        'model_status': model_status,
         'model_loaded': model_artifacts is not None,
         'model_info': model_info,
+        'debug_info': {
+            'current_directory': os.getcwd(),
+            'files_in_directory': os.listdir('.'),
+            'python_version': f"{pd.__version__}",
+            'pandas_version': f"{np.__version__}"
+        },
         'timestamp': pd.Timestamp.now().isoformat()
     })
 
@@ -581,7 +643,33 @@ def model_info():
         'all_features': model_artifacts['feature_names']
     })
 
-@app.route('/example', methods=['GET'])
+@app.route('/reload-model', methods=['POST'])
+def reload_model():
+    """Принудительная перезагрузка модели"""
+    
+    logger.info("🔄 Попытка перезагрузки модели...")
+    
+    model_loaded = load_model()
+    
+    if model_loaded:
+        return jsonify({
+            'success': True,
+            'message': 'Model reloaded successfully',
+            'model_info': {
+                'auc': model_artifacts['performance_metrics']['test_auc'],
+                'f1': model_artifacts['performance_metrics']['test_f1'],
+                'features_count': len(model_artifacts['feature_names'])
+            }
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': 'Failed to reload model',
+            'debug_info': {
+                'current_directory': os.getcwd(),
+                'files_in_directory': os.listdir('.')
+            }
+        }), 500
 def example():
     """Пример входных данных в структурированном JSON формате"""
     
@@ -683,7 +771,13 @@ def internal_error(error):
 # Запуск приложения
 if __name__ == '__main__':
     # Загружаем модель при старте
-    load_model()
+    logger.info("🚀 Запуск приложения...")
+    model_loaded = load_model()
+    
+    if model_loaded:
+        logger.info("✅ Модель успешно загружена, API готов к работе!")
+    else:
+        logger.warning("⚠️ Модель не загружена, но API запустится в режиме диагностики")
     
     # Получаем порт из переменной окружения (Railway)
     port = int(os.environ.get('PORT', 5000))
