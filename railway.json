@@ -1,0 +1,15 @@
+{
+  "build": {
+    "builder": "HEROKU_BUILDPACKS",
+    "buildpacks": [
+      {
+        "url": "heroku/python"
+      }
+    ]
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "sleepApplication": false,
+    "restartPolicyType": "ON_FAILURE"
+  }
+}
