@@ -236,14 +236,23 @@ def parse_time_to_minutes(value):
         return 0
 
 def convert_input_to_features(token_data):
-    """Конвертирует входные данные в признаки (упрощенная версия)"""
+    """Конвертирует входные данные в признаки (ИСПРАВЛЕННАЯ ВЕРСИЯ)"""
     try:
         features = {}
+        logger.info(f"Processing token: {token_data.get('symbol', 'unknown')}")
         
         # Базовая обработка рыночных данных
-        features['market_cap_numeric'] = parse_string_number(token_data.get('market_cap', 0))
-        features['liquidity_numeric'] = parse_string_number(token_data.get('liquidity', 0))
-        features['ath_numeric'] = parse_string_number(token_data.get('ath', 0))
+        market_cap_str = token_data.get('market_cap', '0')
+        liquidity_str = token_data.get('liquidity', '0')
+        ath_str = token_data.get('ath', '0')
+        
+        features['market_cap_numeric'] = parse_string_number(market_cap_str)
+        features['liquidity_numeric'] = parse_string_number(liquidity_str)
+        features['ath_numeric'] = parse_string_number(ath_str)
+        
+        logger.info(f"Market cap: {market_cap_str} -> {features['market_cap_numeric']}")
+        logger.info(f"Liquidity: {liquidity_str} -> {features['liquidity_numeric']}")
+        logger.info(f"ATH: {ath_str} -> {features['ath_numeric']}")
         
         # Ограничиваем выбросы
         features['market_cap_capped'] = min(features['market_cap_numeric'], 10_000_000)
@@ -251,20 +260,23 @@ def convert_input_to_features(token_data):
         features['ath_capped'] = min(features['ath_numeric'], 1_000_000)
         
         # Обработка времени
-        features['token_age_minutes'] = parse_time_to_minutes(token_data.get('token_age', 0))
+        token_age_str = token_data.get('token_age', '0')
+        features['token_age_minutes'] = parse_time_to_minutes(token_age_str)
         features['token_age_hours'] = features['token_age_minutes'] / 60
         features['token_age_days'] = features['token_age_minutes'] / 1440
+        
+        logger.info(f"Token age: {token_age_str} -> {features['token_age_minutes']} minutes")
         
         # Категориальные признаки времени
         features['is_very_new'] = 1 if features['token_age_minutes'] < 60 else 0
         features['is_new'] = 1 if features['token_age_minutes'] < 1440 else 0
         features['is_mature'] = 1 if features['token_age_minutes'] > 10080 else 0
         
-        # Торговые паттерны
-        buy_volume_1m = token_data.get('buy_volume_1m', 0)
-        sell_volume_1m = token_data.get('sell_volume_1m', 0)
-        buy_volume_5m = token_data.get('buy_volume_5m', 0)
-        sell_volume_5m = token_data.get('sell_volume_5m', 0)
+        # Торговые паттерны - ИСПРАВЛЕННЫЕ ПОЛЯ
+        buy_volume_1m = float(token_data.get('buy_volume_1m', 0))
+        sell_volume_1m = float(token_data.get('sell_volume_1m', 0))
+        buy_volume_5m = float(token_data.get('buy_volume_5m', 0))
+        sell_volume_5m = float(token_data.get('sell_volume_5m', 0))
         
         features['total_volume_1m'] = buy_volume_1m + sell_volume_1m
         features['total_volume_5m'] = buy_volume_5m + sell_volume_5m
@@ -272,7 +284,10 @@ def convert_input_to_features(token_data):
         features['buy_sell_ratio_5m'] = buy_volume_5m / sell_volume_5m if sell_volume_5m > 0 else 0
         features['buy_pressure_5m'] = buy_volume_5m / features['total_volume_5m'] if features['total_volume_5m'] > 0 else 0
         
-        # Поведенческие паттерны
+        logger.info(f"Buy volume 5m: {buy_volume_5m}, Sell volume 5m: {sell_volume_5m}")
+        logger.info(f"Buy pressure 5m: {features['buy_pressure_5m']:.3f}")
+        
+        # Поведенческие паттерны - ИСПРАВЛЕННАЯ СТРУКТУРА
         first_buyers = token_data.get('first_buyers', {})
         buyers_green = first_buyers.get('green', 0)
         buyers_blue = first_buyers.get('blue', 0)
@@ -290,20 +305,29 @@ def convert_input_to_features(token_data):
         features['trust_score'] = (buyers_green + buyers_clown) / (total_active + 1)
         features['distrust_score'] = (buyers_red + buyers_moon_new) / (total_active + 1)
         
+        logger.info(f"First buyers - Green: {buyers_green}, Red: {buyers_red}, Total: {total_active}")
+        logger.info(f"Trust score: {features['trust_score']:.3f}")
+        
         # Рыночные коэффициенты
         features['liquidity_to_mcap_ratio'] = features['liquidity_capped'] / features['market_cap_capped'] if features['market_cap_capped'] > 0 else 0
         features['volume_to_liquidity_ratio'] = features['total_volume_5m'] / features['liquidity_capped'] if features['liquidity_capped'] > 0 else 0
         
-        # Концентрация китов (упрощенно)
+        logger.info(f"Liquidity to mcap ratio: {features['liquidity_to_mcap_ratio']:.3f}")
+        
+        # Концентрация китов - ИСПРАВЛЕННАЯ ЛОГИКА
         top_10_holdings = token_data.get('top_10_holdings', [])
         if top_10_holdings and len(top_10_holdings) > 0:
             features['biggest_whale_percent'] = float(top_10_holdings[0]) if top_10_holdings[0] else 0
             features['top3_whales_percent'] = sum(float(x) for x in top_10_holdings[:3] if x)
         else:
-            features['biggest_whale_percent'] = 0
-            features['top3_whales_percent'] = 0
+            # Альтернативный способ через top_10_percent
+            top_10_percent = token_data.get('top_10_percent', 0)
+            features['biggest_whale_percent'] = float(top_10_percent) / 3 if top_10_percent else 0  # Примерная оценка
+            features['top3_whales_percent'] = float(top_10_percent) if top_10_percent else 0
         
-        # Безопасность
+        logger.info(f"Biggest whale: {features['biggest_whale_percent']:.1f}%")
+        
+        # Безопасность - ИСПРАВЛЕННАЯ ЛОГИКА
         security = token_data.get('security', {})
         security_score = 0
         security_score += 1 if security.get('no_mint', False) else 0
@@ -313,9 +337,24 @@ def convert_input_to_features(token_data):
         security_score += 1 if security.get('dex_paid', False) else 0
         features['security_score'] = security_score
         
+        logger.info(f"Security score: {security_score}/5")
+        
         # Дополнительные поля
-        features['total_holders'] = token_data.get('total_holders', 0)
+        features['total_holders'] = float(token_data.get('total_holders', 0))
         features['volume_per_holder'] = features['total_volume_5m'] / features['total_holders'] if features['total_holders'] > 0 else 0
+        
+        # Добавляем метрики активности
+        buys_5m = float(token_data.get('buys_5m', 0))
+        sells_5m = float(token_data.get('sells_5m', 0))
+        features['buy_sell_tx_ratio'] = buys_5m / sells_5m if sells_5m > 0 else 0
+        features['total_transactions_5m'] = buys_5m + sells_5m
+        
+        # Добавляем информацию о volatility
+        ath_change_percent = token_data.get('ath_change_percent', 0)
+        features['ath_change_percent'] = float(ath_change_percent) if ath_change_percent else 0
+        features['is_near_ath'] = 1 if abs(features['ath_change_percent']) < 10 else 0
+        
+        logger.info(f"Generated {len(features)} features")
         
         return features
         
@@ -408,7 +447,7 @@ def simple_predict(features):
         # Возраст токена
         age_minutes = features.get('token_age_minutes', 0)
         if age_minutes < 60:
-            score -= 0.15  # Очень новые токены рискованнее
+            score -= 0.1  # Очень новые токены рискованнее (но не так сильно)
         elif 60 <= age_minutes <= 1440:
             score += 0.1   # Оптимальный возраст
         elif age_minutes > 10080:
@@ -468,6 +507,20 @@ def simple_predict(features):
         elif mcap < 10000:           # Слишком маленькие
             score -= 0.1
         
+        # Активность транзакций
+        total_tx = features.get('total_transactions_5m', 0)
+        if total_tx > 500:  # Высокая активность
+            score += 0.05
+        elif total_tx < 50:  # Низкая активность
+            score -= 0.1
+        
+        # Соотношение покупок к продажам по транзакциям
+        tx_ratio = features.get('buy_sell_tx_ratio', 0)
+        if tx_ratio > 1.2:  # Больше покупательских транзакций
+            score += 0.05
+        elif tx_ratio < 0.8:  # Больше продажных транзакций
+            score -= 0.05
+        
         # Ограничиваем вероятность
         probability = max(0.05, min(0.95, score))
         prediction = 1 if probability > 0.5 else 0
@@ -506,7 +559,9 @@ def simple_predict(features):
                 'trust_score': trust,
                 'security_score': security_score,
                 'liquidity_to_mcap_ratio': liq_mcap_ratio,
-                'market_cap': mcap
+                'market_cap': mcap,
+                'total_transactions_5m': total_tx,
+                'buy_sell_tx_ratio': tx_ratio
             }
         }
         
@@ -537,7 +592,7 @@ def health_check():
         'status': 'healthy',
         'message': 'Memtoken Prediction API is running',
         'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0',
+        'version': '1.1.0',
         'ml_model_loaded': ML_MODEL_LOADED,
         'model_info': {
             'model_name': model_metadata.get('best_model_name', 'Advanced Rules') if model_metadata else 'Advanced Rules',
@@ -566,6 +621,9 @@ def predict():
         
         # Конвертируем входные данные в признаки
         features = convert_input_to_features(data)
+        
+        if not features:
+            return jsonify({'error': 'Failed to extract features from token data'}), 400
         
         # Получаем предсказание
         result = ml_predict(features)
@@ -642,6 +700,27 @@ def predict_batch():
     except Exception as e:
         return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
 
+@app.route('/debug/features', methods=['POST'])
+def debug_features():
+    """Отладка: показать извлеченные признаки"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        features = convert_input_to_features(data)
+        
+        return jsonify({
+            'input_data': data,
+            'extracted_features': features,
+            'feature_count': len(features),
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
+
 @app.route('/debug/files', methods=['GET'])
 def debug_files():
     """Диагностика файлов"""
@@ -653,6 +732,54 @@ def debug_files():
             'json_files': [f for f in os.listdir('.') if f.endswith('.json')]
         }
         return jsonify(files_info)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/test', methods=['GET'])
+def test_with_sample():
+    """Тест с примером данных"""
+    sample_data = {
+        "symbol": "TEST",
+        "name": "Test Token",
+        "contract_address": "test123",
+        "token_age": "1h 30m",
+        "market_cap": "50K",
+        "liquidity": "35K",
+        "ath": "75K",
+        "buy_volume_5m": 15000,
+        "sell_volume_5m": 12000,
+        "buys_5m": 45,
+        "sells_5m": 35,
+        "first_buyers": {
+            "green": 8,
+            "blue": 5,
+            "yellow": 3,
+            "red": 12,
+            "clown": 1,
+            "moon_new": 2
+        },
+        "top_10_holdings": [15.5, 8.2, 6.1, 4.3, 3.8],
+        "total_holders": 150,
+        "security": {
+            "no_mint": True,
+            "blacklist": True,
+            "burnt": True,
+            "dev_sold": False,
+            "dex_paid": True
+        }
+    }
+    
+    try:
+        features = convert_input_to_features(sample_data)
+        result = ml_predict(features)
+        
+        return jsonify({
+            'test_data': sample_data,
+            'features': features,
+            'prediction': result,
+            'timestamp': datetime.now().isoformat()
+        })
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
