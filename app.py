@@ -1,397 +1,555 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import re
-import logging
-import json
+# app.py
 import os
+import pandas as pd
+import numpy as np
+import re
+import joblib
+import logging
+from flask import Flask, request, jsonify
 from datetime import datetime
-import sys
-import warnings
 
-app = Flask(__name__)
+# --- Настройка логгирования ---
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Загружаем модель при старте сервера
-try:
-    model_path = os.path.join(os.path.dirname(__file__), 'memtoken_model_improved.pkl')
-    with open(model_path, 'rb') as f:
-        model_artifacts = pickle.load(f)
-    print("✅ Модель загружена успешно!")
-except Exception as e:
-    print(f"❌ Ошибка загрузки модели: {e}")
-    model_artifacts = None
+# --- Инициализация Flask приложения ---
+app = Flask(__name__)
 
-def parse_token_data(text):
-    """
-    Парсит текстовые данные токена в структурированный формат
-    Оптимизирован для нового формата данных
-    """
+# --- Глобальные переменные для модели и компонентов ---
+model = None
+scaler = None
+encoders = None
+features = None
+model_name = None
+ensemble_weights = None
+
+# --- Функции обработки данных (скопированы из вашего ноутбука) ---
+
+def parse_string_number(value):
+    """Улучшенная версия парсинга строковых чисел"""
+    if pd.isna(value) or value == '' or value == 'N/A':
+        return 0
+    if isinstance(value, (int, float)):
+        return float(value)
+    value = str(value).upper().replace(',', '').strip()
+    value = re.sub(r'[^\d\.\-KMB]', '', value)
+    if value == '' or value == '-':
+        return 0
     try:
-        token_data = {}
-        
-        # Market Cap - "MC: $136.8K"
-        mcap_match = re.search(r'MC:\s*\$?([0-9,.]+)([KMB]?)', text, re.IGNORECASE)
-        if mcap_match:
-            value_str = mcap_match.group(1).replace(',', '')
-            value = float(value_str)
-            unit = mcap_match.group(2).upper()
-            if unit == 'K':
-                value *= 1000
-            elif unit == 'M':
-                value *= 1000000
-            elif unit == 'B':
-                value *= 1000000000
-            token_data['market_cap'] = value
+        if 'K' in value:
+            return float(value.replace('K', '')) * 1_000
+        elif 'M' in value:
+            return float(value.replace('M', '')) * 1_000_000
+        elif 'B' in value:
+            return float(value.replace('B', '')) * 1_000_000_000
         else:
-            token_data['market_cap'] = 0
-        
-        # Liquidity - "Liq: $42.4K"
-        liq_match = re.search(r'Liq:\s*\$?([0-9,.]+)([KMB]?)', text, re.IGNORECASE)
-        if liq_match:
-            value_str = liq_match.group(1).replace(',', '')
-            value = float(value_str)
-            unit = liq_match.group(2).upper()
-            if unit == 'K':
-                value *= 1000
-            elif unit == 'M':
-                value *= 1000000
-            elif unit == 'B':
-                value *= 1000000000
-            token_data['liquidity'] = value
-        else:
-            token_data['liquidity'] = 0
-        
-        # Volume - берем 1min volume: "Volume: $12,129.12"
-        vol_1min_match = re.search(r'1 min:.*?Volume:\s*\$?([0-9,.]+)', text, re.DOTALL)
-        if vol_1min_match:
-            value_str = vol_1min_match.group(1).replace(',', '')
-            token_data['volume_1min'] = float(value_str)
-        else:
-            # Если нет 1min, берем 5min
-            vol_5min_match = re.search(r'5 min:.*?Volume:\s*\$?([0-9,.]+)', text, re.DOTALL)
-            if vol_5min_match:
-                value_str = vol_5min_match.group(1).replace(',', '')
-                token_data['volume_1min'] = float(value_str)
-            else:
-                token_data['volume_1min'] = 0
-        
-        # Last Volume - нет в новом формате, ставим значения по умолчанию
-        token_data['last_volume'] = token_data['volume_1min']  # Используем текущий объем
-        token_data['last_volume_multiplier'] = 1.0
-        
-        # Token Age - "Token age: 25m"
-        age_match = re.search(r'Token age:\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s\s*)?', text, re.IGNORECASE)
-        if age_match:
-            hours = int(age_match.group(1)) if age_match.group(1) else 0
-            minutes = int(age_match.group(2)) if age_match.group(2) else 0
-            seconds = int(age_match.group(3)) if age_match.group(3) else 0
-            total_minutes = hours * 60 + minutes + seconds / 60
-            token_data['token_age_numeric'] = total_minutes
-        else:
-            token_data['token_age_numeric'] = 0
-        
-        # Держатели по цветам - "🟢: 8 | 🔵: 5 | 🟡: 12 | ⭕️: 42"
-        holders_match = re.search(r'🟢:\s*(\d+)\s*\|\s*🔵:\s*(\d+)\s*\|\s*🟡:\s*(\d+)\s*\|\s*⭕️:\s*(\d+)', text)
-        if holders_match:
-            token_data['green_holders'] = int(holders_match.group(1))
-            token_data['blue_holders'] = int(holders_match.group(2))
-            token_data['yellow_holders'] = int(holders_match.group(3))
-            token_data['circle_holders'] = int(holders_match.group(4))
-        else:
-            token_data['green_holders'] = 0
-            token_data['blue_holders'] = 0
-            token_data['yellow_holders'] = 0
-            token_data['circle_holders'] = 0
-        
-        # Специальные держатели - "🤡: 0 | 🌞: 0 | 🌗: 0 | 🌚: 3"
-        special_holders_match = re.search(r'🤡:\s*(\d+)\s*\|\s*🌞:\s*(\d+)\s*\|\s*🌗:\s*(\d+)\s*\|\s*🌚:\s*(\d+)', text)
-        if special_holders_match:
-            token_data['clown_holders'] = int(special_holders_match.group(1))
-            token_data['sun_holders'] = int(special_holders_match.group(2))
-            token_data['half_moon_holders'] = int(special_holders_match.group(3))
-            token_data['dark_moon_holders'] = int(special_holders_match.group(4))
-        else:
-            token_data['clown_holders'] = 0
-            token_data['sun_holders'] = 0
-            token_data['half_moon_holders'] = 0
-            token_data['dark_moon_holders'] = 0
-        
-        # Total holders - "Total: 168"
-        total_holders_match = re.search(r'Total:\s*(\d+)', text)
-        if total_holders_match:
-            token_data['total_holders'] = int(total_holders_match.group(1))
-        else:
-            token_data['total_holders'] = (
-                token_data['green_holders'] + token_data['blue_holders'] + 
-                token_data['yellow_holders'] + token_data['circle_holders']
-            )
-        
-        # Top 10 percent - "Top 10: 23%"
-        top10_match = re.search(r'Top 10:\s*([0-9.]+)%', text)
-        if top10_match:
-            token_data['top10_percent'] = float(top10_match.group(1))
-        else:
-            token_data['top10_percent'] = 50.0
-        
-        # Current/Initial percentages - "Current/Initial: 16.76% / 98.87%"
-        current_initial_match = re.search(r'Current/Initial:\s*([0-9.]+)%\s*/\s*([0-9.]+)%', text)
-        if current_initial_match:
-            token_data['total_now_percent'] = float(current_initial_match.group(1))
-            token_data['total_percent'] = float(current_initial_match.group(2))
-        else:
-            token_data['total_percent'] = 100.0
-            token_data['total_now_percent'] = 50.0
-        
-        # Dev holds - "Dev current balance: 0%"
-        dev_match = re.search(r'Dev current balance:\s*([0-9.]+)%', text)
-        if dev_match:
-            token_data['dev_holds_percent'] = float(dev_match.group(1))
-        else:
-            token_data['dev_holds_percent'] = 0.0
-        
-        # Поля которых нет в новом формате - заполняем значениями по умолчанию
-        token_data['insiders_count'] = 0
-        token_data['insiders_percent'] = 0.0
-        token_data['snipers_count'] = 0
-        token_data['bundle_total'] = 0
-        token_data['bundle_supply_percent'] = 0.0
-        
-        # Создаем дополнительные признаки для модели
-        token_data['volume_to_liquidity'] = float(
-            np.log1p(token_data['volume_1min']) / np.log1p(token_data['liquidity'] + 1)
-            if token_data['liquidity'] > 0 else 0
-        )
-        
-        # Логарифмические признаки
-        token_data['log_market_cap'] = float(np.log1p(token_data['market_cap']))
-        token_data['log_liquidity'] = float(np.log1p(token_data['liquidity']))
-        token_data['log_volume_1min'] = float(np.log1p(token_data['volume_1min']))
-        token_data['log_last_volume'] = float(np.log1p(token_data['last_volume']))
-        
-        # Концентрация держателей
-        token_data['holder_concentration'] = int(
-            token_data['green_holders'] + token_data['blue_holders'] + 
-            token_data['yellow_holders'] + token_data['circle_holders']
-        )
-        
-        # Риск-индикаторы
-        token_data['total_risk_percent'] = float(
-            token_data['dev_holds_percent'] + token_data['insiders_percent']
-        )
-        
-        return convert_to_json_serializable(token_data)
-        
-    except Exception as e:
-        logging.error(f"Ошибка парсинга: {e}")
-        return {}
+            return float(value)
+    except:
+        return 0
 
-def convert_to_json_serializable(obj):
-    """Конвертирует numpy типы в стандартные Python типы для JSON"""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, dict):
-        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_to_json_serializable(item) for item in obj]
-    else:
-        return obj
-
-def predict_token_success(token_data):
-    """
-    Предсказывает успешность токена (с исправлением дрифта данных)
-    """
-    if model_artifacts is None:
-        return {'error': 'Модель не загружена'}
-    
+def parse_time_to_minutes(value):
+    """Улучшенная версия парсинга времени"""
+    if pd.isna(value) or value == '' or value == 'N/A':
+        return 0
+    if isinstance(value, (int, float)):
+        return float(value)
+    total_minutes = 0
+    value = str(value).lower().strip()
     try:
-        # Создаем DataFrame
-        df_new = pd.DataFrame([token_data])
-        
-        # Добавляем недостающие столбцы
-        for col in model_artifacts['feature_names']:
-            if col not in df_new.columns:
-                df_new[col] = 0
-        
-        # Берем только нужные признаки в правильном порядке
-        df_new = df_new[model_artifacts['feature_names']]
-        
-        # Применяем импутер
-        df_imputed = pd.DataFrame(
-            model_artifacts['imputer'].transform(df_new), 
-            columns=model_artifacts['feature_names']
-        )
-        
-        # Получаем исходные предсказания модели
-        raw_probability = float(model_artifacts['model'].predict_proba(df_imputed)[0, 1])
-        
-        # 🔄 ИСПРАВЛЕНИЕ ДРИФТА: Инвертируем вероятность
-        probability = 1.0 - raw_probability
-        prediction = int(probability >= 0.5)
-        
-        # Определяем уровень уверенности
-        confidence_score = abs(probability - 0.5) * 2
-        if confidence_score > 0.8:
-            confidence_level = "Очень высокая"
-        elif confidence_score > 0.6:
-            confidence_level = "Высокая"
-        elif confidence_score > 0.4:
-            confidence_level = "Средняя"
-        else:
-            confidence_level = "Низкая"
-        
-        # Определяем рекомендацию
-        if probability >= 0.7:
-            recommendation = "ПОКУПАТЬ"
-            risk_level = "Низкий"
-        elif probability >= 0.5:
-            recommendation = "ИЗУЧИТЬ"
-            risk_level = "Средний"
-        else:
-            recommendation = "ПРОПУСТИТЬ"
-            risk_level = "Высокий"
-        
-        result = {
-            'prediction': 'ДА' if prediction == 1 else 'НЕТ',
-            'probability': round(float(probability), 4),
-            'probability_percent': f"{probability*100:.1f}%",
-            'confidence_level': confidence_level,
-            'confidence_score': round(float(confidence_score), 4),
-            'recommendation': recommendation,
-            'risk_level': risk_level,
-            'threshold_conservative': 'ДА' if probability >= 0.7 else 'НЕТ',
-            'threshold_optimal': 'ДА' if probability >= 0.5 else 'НЕТ',
-            'threshold_aggressive': 'ДА' if probability >= 0.3 else 'НЕТ',
-            
-            # Информация о коррекции для отладки
-            'model_info': {
-                'raw_probability': round(raw_probability, 4),
-                'corrected_probability': round(probability, 4),
-                'drift_correction': True,
-                'data_format': 'new_format_optimized'
-            }
+        days = re.findall(r'(\d+(?:\.\d+)?)d', value)
+        if days:
+            total_minutes += float(days[0]) * 1440
+        hours = re.findall(r'(\d+(?:\.\d+)?)h', value)
+        if hours:
+            total_minutes += float(hours[0]) * 60
+        minutes = re.findall(r'(\d+(?:\.\d+)?)m(?!s)', value)
+        if minutes:
+            total_minutes += float(minutes[0])
+        seconds = re.findall(r'(\d+(?:\.\d+)?)s', value)
+        if seconds:
+            total_minutes += float(seconds[0]) / 60
+        if total_minutes == 0:
+            clean_value = re.sub(r'[^\d\.]', '', value)
+            if clean_value:
+                total_minutes = float(clean_value)
+        return total_minutes
+    except:
+        return 0
+
+def parse_top10_holdings(value, total_top10_percent=None):
+    """Улучшенная версия обработки концентрации китов с дополнительными метриками"""
+    if pd.isna(value) or value == '' or value == 'N/A':
+        return {
+            'top1_real_percent': 0, 'top3_real_percent': 0, 'top5_real_percent': 0,
+            'concentration_ratio': 0, 'internal_distribution': [0]*10,
+            'gini_coefficient': 0, 'herfindahl_index': 0
         }
+    try:
+        # Обработка как списка или строки
+        if isinstance(value, list):
+            internal_percentages = [float(x) for x in value if x is not None]
+        else:
+            value_clean = str(value).strip('[]').replace(' ', '')
+            internal_percentages = [float(x) for x in value_clean.split(',') if x.strip()]
         
-        return convert_to_json_serializable(result)
-        
-    except Exception as e:
-        logging.error(f"Ошибка предсказания: {e}")
-        return {'error': f'Ошибка предсказания: {str(e)}'}
+        while len(internal_percentages) < 10:
+            internal_percentages.append(0)
+            
+        if total_top10_percent is None or pd.isna(total_top10_percent) or total_top10_percent <= 0:
+            real_percentages = internal_percentages
+        else:
+            total_internal = sum(internal_percentages)
+            if total_internal > 0:
+                normalized_percentages = [x / total_internal for x in internal_percentages]
+                real_percentages = [x * total_top10_percent / 100 for x in normalized_percentages]
+            else:
+                real_percentages = [0] * 10
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Проверка работоспособности API"""
+        top1_real = real_percentages[0] if len(real_percentages) > 0 else 0
+        top3_real = sum(real_percentages[:3]) if len(real_percentages) >= 3 else sum(real_percentages)
+        top5_real = sum(real_percentages[:5]) if len(real_percentages) >= 5 else sum(real_percentages)
+
+        total_internal_nonzero = sum([x for x in internal_percentages if x > 0])
+        concentration_ratio = internal_percentages[0] / total_internal_nonzero if total_internal_nonzero > 0 else 0
+
+        sorted_percentages = sorted([x for x in internal_percentages if x > 0], reverse=True)
+        n = len(sorted_percentages)
+        if n > 1:
+            cumsum = np.cumsum(sorted_percentages)
+            gini_coefficient = (n + 1 - 2 * sum((n + 1 - i) * x for i, x in enumerate(cumsum))) / (n * sum(sorted_percentages))
+        else:
+            gini_coefficient = 0
+
+        total_sum = sum(internal_percentages)
+        if total_sum > 0:
+            herfindahl_index = sum((x / total_sum) ** 2 for x in internal_percentages if x > 0)
+        else:
+            herfindahl_index = 0
+
+        return {
+            'top1_real_percent': top1_real,
+            'top3_real_percent': top3_real,
+            'top5_real_percent': top5_real,
+            'concentration_ratio': concentration_ratio,
+            'internal_distribution': internal_percentages,
+            'gini_coefficient': gini_coefficient,
+            'herfindahl_index': herfindahl_index
+        }
+    except Exception as e:
+        logger.error(f"Ошибка в parse_top10_holdings: {e}")
+        return {
+            'top1_real_percent': 0, 'top3_real_percent': 0, 'top5_real_percent': 0,
+            'concentration_ratio': 0, 'internal_distribution': [0]*10,
+            'gini_coefficient': 0, 'herfindahl_index': 0
+        }
+
+# --- Функция предсказания ---
+def predict_memtoken_advanced(token_data):
+    """
+    Улучшенная функция предсказания успеха мемтокена
+    Args:
+        token_data (dict): Данные токена
+    Returns:
+        dict: Результат предсказания
+    """
+    global model, scaler, encoders, features, model_name, ensemble_weights
+
+    if model is None or scaler is None or encoders is None or features is None:
+        return {"error": "Модель не загружена. Проверьте логи сервера."}
+
+    try:
+        token_df = pd.DataFrame([token_data])
+        
+        # --- Обработка данных ---
+        string_cols = ['market_cap', 'liquidity', 'ath']
+        for col in string_cols:
+            if col in token_df.columns:
+                token_df.loc[:, col] = token_df[col].apply(parse_string_number)
+                # Используем фиксированные значения для ограничения выбросов, если нужно
+                # Для простоты здесь можно оставить без ограничения или использовать данные из обучающего сета
+                # token_df.loc[:, f'{col}_capped'] = token_df[col].clip(upper=q99_from_training) 
+                # Пока просто копируем
+                token_df.loc[:, f'{col}_capped'] = token_df[col]
+
+        if 'token_age' in token_df.columns:
+            token_df.loc[:, 'token_age_minutes'] = token_df['token_age'].apply(parse_time_to_minutes)
+            token_df.loc[:, 'token_age_hours'] = token_df['token_age_minutes'] / 60
+            token_df.loc[:, 'token_age_days'] = token_df['token_age_minutes'] / 1440
+            token_df.loc[:, 'is_very_new'] = (token_df['token_age_minutes'] < 60).astype(int)
+            token_df.loc[:, 'is_new'] = (token_df['token_age_minutes'] < 1440).astype(int)
+            token_df.loc[:, 'is_mature'] = (token_df['token_age_minutes'] > 10080).astype(int)
+            token_df.loc[:, 'is_very_mature'] = (token_df['token_age_minutes'] > 43200).astype(int)
+            token_df.loc[:, 'token_age_log'] = np.log1p(token_df['token_age_minutes'])
+            token_df.loc[:, 'token_age_sqrt'] = np.sqrt(token_df['token_age_minutes'])
+
+        if 'top_10_holdings' in token_df.columns and 'top_10_percent' in token_df.columns:
+             holdings_metrics = []
+             for i, row in token_df.iterrows():
+                 top10_total = row.get('top_10_percent', 0)
+                 holdings_str = row.get('top_10_holdings', '')
+                 metrics = parse_top10_holdings(holdings_str, top10_total)
+                 holdings_metrics.append(metrics)
+             token_df.loc[:, 'biggest_whale_percent'] = [x['top1_real_percent'] for x in holdings_metrics]
+             token_df.loc[:, 'top3_whales_percent'] = [x['top3_real_percent'] for x in holdings_metrics]
+             token_df.loc[:, 'top5_whales_percent'] = [x['top5_real_percent'] for x in holdings_metrics]
+             token_df.loc[:, 'whale_dominance_index'] = [x['concentration_ratio'] for x in holdings_metrics]
+             token_df.loc[:, 'gini_coefficient'] = [x['gini_coefficient'] for x in holdings_metrics]
+             token_df.loc[:, 'herfindahl_index'] = [x['herfindahl_index'] for x in holdings_metrics]
+             for i in range(10):
+                 token_df.loc[:, f'whale_{i+1}_internal_share'] = [x['internal_distribution'][i] for x in holdings_metrics]
+
+        # --- Создание признаков ---
+        # Торговые паттерны
+        token_df.loc[:, 'buy_sell_ratio_1m'] = np.where(token_df['sell_volume_1m'] > 0, 
+                                               token_df['buy_volume_1m'] / token_df['sell_volume_1m'], 0)
+        token_df.loc[:, 'buy_sell_ratio_5m'] = np.where(token_df['sell_volume_5m'] > 0, 
+                                               token_df['buy_volume_5m'] / token_df['sell_volume_5m'], 0)
+        token_df.loc[:, 'total_volume_1m'] = token_df['buy_volume_1m'] + token_df['sell_volume_1m']
+        token_df.loc[:, 'total_volume_5m'] = token_df['buy_volume_5m'] + token_df['sell_volume_5m']
+        token_df.loc[:, 'buy_pressure_1m'] = np.where(token_df['total_volume_1m'] > 0, 
+                                             token_df['buy_volume_1m'] / token_df['total_volume_1m'], 0)
+        token_df.loc[:, 'buy_pressure_5m'] = np.where(token_df['total_volume_5m'] > 0, 
+                                             token_df['buy_volume_5m'] / token_df['total_volume_5m'], 0)
+        token_df.loc[:, 'buy_pressure_change'] = token_df['buy_pressure_5m'] - token_df['buy_pressure_1m']
+        token_df.loc[:, 'avg_buy_size_1m'] = np.where(token_df['buys_1m'] > 0, 
+                                   token_df['buy_volume_1m'] / token_df['buys_1m'], 0)
+        token_df.loc[:, 'avg_sell_size_1m'] = np.where(token_df['sells_1m'] > 0, 
+                                    token_df['sell_volume_1m'] / token_df['sells_1m'], 0)
+        token_df.loc[:, 'avg_buy_size_5m'] = np.where(token_df['buys_5m'] > 0, 
+                                   token_df['buy_volume_5m'] / token_df['buys_5m'], 0)
+        token_df.loc[:, 'avg_sell_size_5m'] = np.where(token_df['sells_5m'] > 0, 
+                                    token_df['sell_volume_5m'] / token_df['sells_5m'], 0)
+        token_df.loc[:, 'buy_vs_sell_size_1m'] = np.where(token_df['avg_sell_size_1m'] > 0,
+                                       token_df['avg_buy_size_1m'] / token_df['avg_sell_size_1m'], 0)
+        token_df.loc[:, 'buy_vs_sell_size_5m'] = np.where(token_df['avg_sell_size_5m'] > 0,
+                                       token_df['avg_buy_size_5m'] / token_df['avg_sell_size_5m'], 0)
+        token_df.loc[:, 'volume_growth_1m_to_5m'] = np.where(token_df['volume_1m'] > 0,
+                                          token_df['volume_5m'] / token_df['volume_1m'], 0)
+        token_df.loc[:, 'buy_growth_1m_to_5m'] = np.where(token_df['buys_1m'] > 0,
+                                       token_df['buys_5m'] / token_df['buys_1m'], 0)
+        token_df.loc[:, 'sell_growth_1m_to_5m'] = np.where(token_df['sells_1m'] > 0,
+                                        token_df['sells_5m'] / token_df['sells_1m'], 0)
+
+        # Поведенческие паттерны
+        token_df.loc[:, 'total_holders_emoji'] = (token_df['buyers_green'] + token_df['buyers_blue'] + 
+                                         token_df['buyers_yellow'] + token_df['buyers_red'])
+        token_df.loc[:, 'total_snipers'] = (token_df['buyers_clown'] + token_df['buyers_sun'] + 
+                                   token_df['buyers_moon_half'] + token_df['buyers_moon_new'])
+        token_df.loc[:, 'holders_keep_ratio'] = np.where(token_df['total_holders_emoji'] > 0,
+                                      (token_df['buyers_green'] + token_df['buyers_blue']) / token_df['total_holders_emoji'], 0)
+        token_df.loc[:, 'holders_sell_ratio'] = np.where(token_df['total_holders_emoji'] > 0,
+                                      (token_df['buyers_yellow'] + token_df['buyers_red']) / token_df['total_holders_emoji'], 0)
+        token_df.loc[:, 'holders_diamond_hands'] = np.where(token_df['total_holders_emoji'] > 0,
+                                         token_df['buyers_green'] / token_df['total_holders_emoji'], 0)
+        token_df.loc[:, 'holders_paper_hands'] = np.where(token_df['total_holders_emoji'] > 0,
+                                       token_df['buyers_red'] / token_df['total_holders_emoji'], 0)
+        token_df.loc[:, 'snipers_keep_ratio'] = np.where(token_df['total_snipers'] > 0,
+                                      (token_df['buyers_clown'] + token_df['buyers_sun']) / token_df['total_snipers'], 0)
+        token_df.loc[:, 'snipers_dump_ratio'] = np.where(token_df['total_snipers'] > 0,
+                                      (token_df['buyers_moon_half'] + token_df['buyers_moon_new']) / token_df['total_snipers'], 0)
+        token_df.loc[:, 'snipers_vs_holders_ratio'] = np.where(token_df['total_holders_emoji'] > 0,
+                                            token_df['total_snipers'] / token_df['total_holders_emoji'], 0)
+        token_df.loc[:, 'total_active_addresses'] = token_df['total_holders_emoji'] + token_df['total_snipers']
+        token_df.loc[:, 'trust_score'] = (token_df['buyers_green'] + token_df['buyers_clown']) / (token_df['total_active_addresses'] + 1)
+        token_df.loc[:, 'distrust_score'] = (token_df['buyers_red'] + token_df['buyers_moon_new']) / (token_df['total_active_addresses'] + 1)
+
+        # Рыночные коэффициенты
+        token_df.loc[:, 'liquidity_to_mcap_ratio'] = np.where(token_df['market_cap_capped'] > 0,
+                                                     token_df['liquidity_capped'] / token_df['market_cap_capped'], 0)
+        token_df.loc[:, 'volume_to_liquidity_ratio'] = np.where(token_df['liquidity_capped'] > 0,
+                                                       token_df['total_volume_5m'] / token_df['liquidity_capped'], 0)
+        token_df.loc[:, 'volume_to_mcap_ratio'] = np.where(token_df['market_cap_capped'] > 0,
+                                        token_df['total_volume_5m'] / token_df['market_cap_capped'], 0)
+        # token_df.loc[:, 'volume_per_sol'] и mcap_per_sol требуют sol_pooled, который может быть null
+        # Пропустим их или заполним 0
+        token_df.loc[:, 'volume_per_sol'] = np.where(token_df['sol_pooled'] > 0,
+                                      token_df['total_volume_5m'] / token_df['sol_pooled'], 0)
+        token_df.loc[:, 'mcap_per_sol'] = np.where(token_df['sol_pooled'] > 0,
+                                    token_df['market_cap_capped'] / token_df['sol_pooled'], 0)
+        token_df.loc[:, 'ratio_change'] = token_df['current_ratio'] - token_df['initial_ratio']
+        token_df.loc[:, 'ratio_change_percent'] = np.where(token_df['initial_ratio'] > 0,
+                                        (token_df['current_ratio'] - token_df['initial_ratio']) / token_df['initial_ratio'], 0)
+
+        # Концентрация и держатели
+        if 'total_holders' in token_df.columns:
+            token_df.loc[:, 'volume_per_holder'] = np.where(token_df['total_holders'] > 0,
+                                         token_df['total_volume_5m'] / token_df['total_holders'], 0)
+            token_df.loc[:, 'mcap_per_holder'] = np.where(token_df['total_holders'] > 0,
+                                       token_df['market_cap_capped'] / token_df['total_holders'], 0)
+            token_df.loc[:, 'active_to_total_holders_ratio'] = np.where(token_df['total_holders'] > 0,
+                                                     token_df['total_active_addresses'] / token_df['total_holders'], 0)
+        # freshies_growth и veteran_ratio
+        if 'freshies_1d_percent' in token_df.columns and 'freshies_7d_percent' in token_df.columns:
+            token_df.loc[:, 'freshies_growth'] = token_df['freshies_7d_percent'] - token_df['freshies_1d_percent']
+            token_df.loc[:, 'veteran_ratio'] = 100 - token_df['freshies_7d_percent']
+        # dev_risk
+        if 'dev_current_balance_percent' in token_df.columns:
+            token_df.loc[:, 'dev_risk_high'] = (token_df['dev_current_balance_percent'] > 10).astype(int)
+            token_df.loc[:, 'dev_risk_medium'] = ((token_df['dev_current_balance_percent'] > 5) & 
+                               (token_df['dev_current_balance_percent'] <= 10)).astype(int)
+
+        # Безопасность
+        security_features = ['security_no_mint', 'security_blacklist', 'security_burnt', 
+                            'security_dev_sold', 'security_dex_paid']
+        # Убедимся, что колонки существуют
+        for sf in security_features:
+             if sf not in token_df.columns:
+                  token_df.loc[:, sf] = 0 # или False для булевых
+        token_df.loc[:, 'security_score'] = token_df[security_features].sum(axis=1)
+        token_df.loc[:, 'security_perfect'] = (token_df['security_score'] == 5).astype(int)
+        token_df.loc[:, 'security_risky'] = (token_df['security_score'] <= 2).astype(int)
+
+        # Логарифмические преобразования
+        log_features = ['market_cap_capped', 'liquidity_capped', 'ath_capped', 'total_holders', 'total_volume_5m', 'sol_pooled']
+        for col in log_features:
+            if col in token_df.columns:
+                token_df.loc[:, f'{col}_log'] = np.log1p(token_df[col])
+                token_df.loc[:, f'{col}_sqrt'] = np.sqrt(token_df[col])
+                token_df.loc[:, f'{col}_inv'] = 1 / (token_df[col] + 1)
+
+        # Взаимодействия признаков
+        token_df.loc[:, 'volume_liquidity_interaction'] = token_df['total_volume_5m'] * token_df['liquidity_capped_log']
+        token_df.loc[:, 'volume_mcap_interaction'] = token_df['total_volume_5m'] * token_df['market_cap_capped_log']
+        token_df.loc[:, 'age_volume_interaction'] = token_df['token_age_log'] * token_df['total_volume_5m']
+        token_df.loc[:, 'age_holders_interaction'] = token_df['token_age_log'] * np.log1p(token_df['total_holders'])
+        token_df.loc[:, 'trust_whale_interaction'] = token_df['trust_score'] * token_df.get('whale_centralization', 0) # Предполагаем 0 если нет
+        token_df.loc[:, 'distrust_whale_interaction'] = token_df['distrust_score'] * token_df.get('dangerous_whale_concentration', 0) # Предполагаем 0 если нет
+
+        # --- Подготовка к предсказанию ---
+        available_features = [col for col in features if col in token_df.columns]
+        missing_features = [col for col in features if col not in token_df.columns]
+        
+        if missing_features:
+            logger.warning(f"Отсутствуют признаки: {missing_features}. Заполняем нулями.")
+            for col in missing_features:
+                token_df.loc[:, col] = 0
+        
+        X_token = token_df[features].fillna(0)
+
+        # Кодирование категориальных признаков
+        for col in X_token.columns:
+            if col in encoders:
+                try:
+                    # Обработка неизвестных меток
+                    le = encoders[col]
+                    # Проверяем, есть ли все уникальные значения в обученной кодировке
+                    unique_vals = X_token[col].unique()
+                    known_vals = set(le.classes_)
+                    unknown_vals = set(unique_vals) - known_vals
+                    if unknown_vals:
+                        logger.warning(f"Неизвестные значения в '{col}': {unknown_vals}. Заменяем на 'unknown'.")
+                        # Создаем временную копию LabelEncoder для добавления 'unknown'
+                        temp_le = LabelEncoder()
+                        # temp_le.classes_ = np.append(le.classes_, 'unknown')
+                        # Но это не работает напрямую. Проще заполнить медианой или модой, или просто 0.
+                        # Или использовать try-except и заполнять 0
+                        X_token.loc[:, col] = X_token[col].apply(lambda x: x if x in known_vals else 'unknown' if 'unknown' in known_vals else le.classes_[0])
+                    
+                    X_token.loc[:, col] = le.transform(X_token[col].astype(str))
+                except Exception as e:
+                     logger.error(f"Ошибка кодирования '{col}': {e}. Заполняем 0.")
+                     X_token.loc[:, col] = 0 # Заполнение при ошибке
+
+        # Масштабирование
+        X_token_scaled = scaler.transform(X_token)
+
+        # Предсказание
+        if model_name == 'Ensemble' and isinstance(model, dict) and ensemble_weights is not None:
+            ensemble_probas = []
+            for name, m in model.items():
+                try:
+                    prob = m.predict_proba(X_token_scaled)[0, 1]
+                    ensemble_probas.append(prob)
+                except Exception as e:
+                    logger.error(f"Ошибка предсказания модели {name}: {e}")
+                    ensemble_probas.append(0.5) # Значение по умолчанию при ошибке
+            
+            if ensemble_probas:
+                 probability = np.average(ensemble_probas, weights=ensemble_weights)
+                 confidence_interval = (np.min(ensemble_probas), np.max(ensemble_probas))
+            else:
+                 probability = 0.5
+                 confidence_interval = (0.0, 1.0)
+        else:
+            try:
+                probability = model.predict_proba(X_token_scaled)[0, 1]
+                confidence_interval = (probability * 0.9, min(probability * 1.1, 1.0))
+            except Exception as e:
+                 logger.error(f"Ошибка предсказания основной модели: {e}")
+                 probability = 0.5
+                 confidence_interval = (0.0, 1.0)
+
+        prediction = int(probability > 0.5)
+        
+        if probability >= 0.85:
+            recommendation = "🔥 VERY STRONG BUY - Исключительно высокие шансы на рост!"
+        elif probability >= 0.75:
+            recommendation = "🚀 STRONG BUY - Очень высокие шансы на рост"
+        elif probability >= 0.65:
+            recommendation = "✅ BUY - Хорошие шансы на рост"
+        elif probability >= 0.55:
+            recommendation = "⚖️ CONSIDER - Умеренные шансы, анализируйте дополнительно"
+        elif probability >= 0.45:
+            recommendation = "⚠️ CAUTION - Низкие шансы, высокий риск"
+        elif probability >= 0.35:
+            recommendation = "❌ AVOID - Очень низкие шансы на рост"
+        else:
+            recommendation = "🚫 STRONG AVOID - Крайне низкие шансы"
+
+        return {
+            "success": True,
+            "probability": float(probability),
+            "prediction": prediction, # 1 - успешный, 0 - неуспешный
+            "recommendation": recommendation,
+            "confidence_interval": [float(confidence_interval[0]), float(confidence_interval[1])]
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка в predict_memtoken_advanced: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": f"Ошибка обработки данных или предсказания: {str(e)}",
+            "probability": 0.5,
+            "prediction": 0,
+            "recommendation": "❓ ОШИБКА - Не удалось обработать данные",
+            "confidence_interval": [0.0, 1.0]
+        }
+
+# --- Загрузка модели при запуске ---
+def load_model():
+    """Загружает обученную модель и её компоненты."""
+    global model, scaler, encoders, features, model_name, ensemble_weights
+    try:
+        model_path = 'memtoken_model_improved.pkl'
+        scaler_path = 'memtoken_scaler_improved.pkl'
+        encoders_path = 'memtoken_encoders_improved.pkl'
+        features_path = 'memtoken_features_improved.pkl'
+        metadata_path = 'memtoken_model_metadata.json'
+        ensemble_weights_path = 'memtoken_ensemble_weights.pkl'
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Файл модели {model_path} не найден.")
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(f"Файл скейлера {scaler_path} не найден.")
+        if not os.path.exists(encoders_path):
+            raise FileNotFoundError(f"Файл энкодеров {encoders_path} не найден.")
+        if not os.path.exists(features_path):
+            raise FileNotFoundError(f"Файл признаков {features_path} не найден.")
+
+        model = joblib.load(model_path)
+        scaler = joblib.load(scaler_path)
+        encoders = joblib.load(encoders_path)
+        features = joblib.load(features_path)
+        
+        # Определяем тип модели
+        if os.path.exists(metadata_path):
+             import json
+             with open(metadata_path, 'r') as f:
+                 metadata = json.load(f)
+             model_name = metadata.get('best_model_name', 'Unknown')
+             if model_name == 'Ensemble' and os.path.exists(ensemble_weights_path):
+                  ensemble_weights = np.array(joblib.load(ensemble_weights_path))
+             logger.info(f"Загружена модель: {model_name}")
+        else:
+             # Предположим, если это словарь, то ансамбль
+             model_name = 'Ensemble' if isinstance(model, dict) else 'Single_Model'
+             logger.info(f"Предположительно загружена модель: {model_name}")
+
+        logger.info("✅ Модель и компоненты успешно загружены.")
+        logger.info(f"   📊 Признаков: {len(features)}")
+        logger.info(f"   🧠 Тип модели: {model_name}")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки модели: {e}", exc_info=True)
+        # Можно завершить работу приложения или продолжить с ошибкой
+        # raise e # Раскомментируйте, если хотите, чтобы приложение не запускалось при ошибке загрузки
+
+# --- Маршруты Flask ---
+
+@app.route('/')
+def home():
     return jsonify({
-        'status': 'healthy',
-        'model_loaded': model_artifacts is not None,
-        'version': '2.1',
-        'optimized_for': 'new_data_format',
-        'drift_correction': 'enabled',
-        'environment': os.environ.get('RAILWAY_ENVIRONMENT', 'unknown')
+        "message": "API для предсказания успеха мемтокенов",
+        "status": "running",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     })
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """Основной эндпоинт для предсказания"""
+    """Endpoint для получения предсказания."""
     try:
+        # Получаем JSON данные из запроса
         data = request.get_json()
+
+        if not data:
+            return jsonify({"error": "JSON данные не предоставлены"}), 400
+
+        # Проверка на наличие ключа 'symbol' или других обязательных полей может быть добавлена
+        # Предполагаем, что data - это словарь с данными одного токена
+        # или список с одним элементом
         
-        if not data or 'text' not in data:
-            return jsonify({'error': 'Необходимо передать поле "text" с данными токена'}), 400
-        
-        # Парсим текст
-        token_data = parse_token_data(data['text'])
-        
-        if not token_data:
-            return jsonify({'error': 'Не удалось распарсить данные токена'}), 400
-        
-        # Получаем предсказание
-        result = predict_token_success(token_data)
-        
-        # Добавляем распарсенные данные для отладки
-        if data.get('include_parsed_data', False):
-            result['parsed_data'] = convert_to_json_serializable(token_data)
-        
+        if isinstance(data, list) and len(data) > 0:
+             token_data = data[0] # Берем первый токен из списка
+        elif isinstance(data, dict):
+             token_data = data
+        else:
+             return jsonify({"error": "Неверный формат данных. Ожидается JSON объект или массив с объектом."}), 400
+
+        # --- Форматирование входных данных под ожидаемый формат функции ---
+        # Преобразуем вложенные объекты в плоские поля
+        formatted_data = {}
+
+        # Базовые поля
+        for key, value in token_data.items():
+            if key not in ['first_buyers', 'current_initial_ratio', 'security']:
+                formatted_data[key] = value
+
+        # first_buyers
+        if 'first_buyers' in token_data:
+            fb = token_data['first_buyers']
+            formatted_data['buyers_green'] = fb.get('green', 0)
+            formatted_data['buyers_blue'] = fb.get('blue', 0)
+            formatted_data['buyers_yellow'] = fb.get('yellow', 0)
+            formatted_data['buyers_red'] = fb.get('red', 0)
+            formatted_data['buyers_clown'] = fb.get('clown', 0)
+            formatted_data['buyers_sun'] = fb.get('sun', 0)
+            formatted_data['buyers_moon_half'] = fb.get('moon_half', 0)
+            formatted_data['buyers_moon_new'] = fb.get('moon_new', 0)
+
+        # current_initial_ratio
+        if 'current_initial_ratio' in token_data:
+            cir = token_data['current_initial_ratio']
+            formatted_data['current_ratio'] = cir.get('current', 0)
+            formatted_data['initial_ratio'] = cir.get('initial', 0)
+
+        # security
+        if 'security' in token_data:
+            sec = token_data['security']
+            formatted_data['security_no_mint'] = int(sec.get('no_mint', False))
+            formatted_data['security_blacklist'] = int(sec.get('blacklist', False))
+            formatted_data['security_burnt'] = int(sec.get('burnt', False))
+            formatted_data['security_dev_sold'] = int(sec.get('dev_sold', False))
+            formatted_data['security_dex_paid'] = int(sec.get('dex_paid', False))
+
+        # --- Вызов функции предсказания ---
+        result = predict_memtoken_advanced(formatted_data)
+
         return jsonify(result)
-        
+
     except Exception as e:
-        logging.error(f"Ошибка API: {e}")
-        return jsonify({'error': f'Внутренняя ошибка сервера: {str(e)}'}), 500
+        logger.error(f"Ошибка в /predict: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "error": f"Внутренняя ошибка сервера: {str(e)}"
+        }), 500
 
-@app.route('/test', methods=['GET'])
-def test():
-    """Тестовый эндпоинт с данными нового формата"""
-    test_text = """🎲 $PVE | President vs Elon
-
-3nuogKUQuxfxjCRud7Bpm5a9Q7eT7mxpFGNe9WeNbonk
-
-⏳ Token age:  25m  | 👁 14
-├ MC: $136.8K
-├ Liq: $42.4K / SOL pooled: 111.02
-└ ATH: $134.6K (-4% / 4s)
-
-1 min:
-├ Volume: $12,129.12
-├ Buy volume ($): $6,446.81
-├ Sell volume ($): $5,682.31
-├ Buys: 165
-└ Sells: 177
-
-5 min:
-├ Volume: $71,175.80
-├ Buy volume ($): $46,124.03
-├ Sell volume ($): $25,051.77
-├ Buys: 585
-└ Sells: 448
-
-🎯 First 70 buyers:
-🌚🌚🌚🟡🟡🟡🟡🟡🟡🟡
-🟡🟢🟡⭕️⭕️⭕️⭕️⭕️⭕️⭕️
-⭕️🟢🔵🔵🟢🟢⭕️🟡🟡⭕️
-⭕️⭕️⭕️⭕️⭕️⭕️⭕️⭕️⭕️⭕️
-⭕️⭕️⭕️⭕️⭕️⭕️⭕️⭕️🟢🟢
-🔵⭕️⭕️⭕️🟢🔵⭕️⭕️⭕️⭕️
-🔵⭕️⭕️⭕️🟢⭕️⭕️⭕️⭕️🟡
-
-├ 🟢: 8 | 🔵: 5 | 🟡: 12 | ⭕️: 42
-├ 🤡: 0 | 🌞: 0 | 🌗: 0 | 🌚: 3
-├ Current/Initial: 16.76% / 98.87%
-
-👥 Holders:
-├ Total: 168
-├ Freshies: 8.8% 1D | 87% 7D
-├ Top 10: 23%
-💰 Top 10 Holding (%)
-15.82 | 2.48 | 2.42 | 2.42 | 2.41 | 2.38 | 2.31 | 2.29 | 2.26 | 2.22
-
-😎 Dev
-├ Dev current balance: 0%
-└ Dev SOL balance: 0 SOL
-
-🔒 Security:
-├ NoMint: 🟢
-├ Blacklist: 🟢
-├ Burnt: 🟢
-├ Dev Sold: 🟢
-└ Dex Paid: 🔴"""
-    
-    token_data = parse_token_data(test_text)
-    result = predict_token_success(token_data)
-    result['parsed_data'] = convert_to_json_serializable(token_data)
-    
-    return jsonify(result)
-
+# --- Запуск приложения ---
 if __name__ == '__main__':
+    # Загружаем модель один раз при старте
+    load_model()
+    
+    # Получаем порт из переменной окружения (Railway) или используем 5000 по умолчанию
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('RAILWAY_ENVIRONMENT') != 'production'
     
-    print("🚀 Token Prediction API v2.1")
-    print(f"📍 Порт: {port}")
-    print(f"🔄 Оптимизировано для нового формата данных")
-    print(f"🧪 Тест: /test")
-    print(f"❤️  Статус: /health")
-    
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    # Запуск Flask приложения
+    app.run(host='0.0.0.0', port=port, debug=False) # debug=False для продакшена
