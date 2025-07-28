@@ -1,12 +1,10 @@
-flask
-gunicorn
-pandas
-numpy
-scikit-learn
-lightgbm
-xgboost
-catboost
-imbalanced-learn
-joblib
-# seaborn # Не нужен для работы API, только для визуализации
-# optuna # Не нужен для работы API, только для обучения
+flask==3.0.0
+gunicorn==21.2.0
+pandas==2.2.2
+numpy==2.0.2
+scikit-learn==1.6.1
+xgboost==3.0.2
+lightgbm==4.6.0
+catboost==1.2.8
+imbalanced-learn # Или укажите конкретную версию, если знаете
+joblib==1.5.1
