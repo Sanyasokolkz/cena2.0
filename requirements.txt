@@ -1,11 +1,6 @@
-fastapi
-uvicorn  # Optional if using Hypercorn
-hypercorn
-pandas
-numpy
-scikit-learn
-joblib
-xgboost
-lightgbm
-catboost
-imbalanced-learn
+Flask==2.3.3
+Flask-CORS==4.0.0
+pandas==2.0.3
+numpy==1.24.3
+gunicorn==21.2.0
+python-dotenv==1.0.0
