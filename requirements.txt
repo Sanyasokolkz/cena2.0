@@ -1,5 +1,6 @@
 fastapi
-uvicorn
+uvicorn  # Optional if using Hypercorn
+hypercorn
 pandas
 numpy
 scikit-learn
@@ -7,4 +8,4 @@ joblib
 xgboost
 lightgbm
 catboost
-imbalanced-learn  # На всякий случай, хотя для inference не обязателен
+imbalanced-learn
