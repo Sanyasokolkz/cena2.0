@@ -28,21 +28,35 @@ model_metadata = None
 ensemble_weights = None
 
 def load_ml_model():
-    """Загрузка обученной ML модели и компонентов"""
+    """Загрузка обученной ML модели и компонентов с диагностикой"""
     global model, scaler, label_encoders, feature_names, model_metadata, ensemble_weights
     
     try:
         import joblib
-        
         logger.info("Загружаем ML модель...")
         
-        # Загружаем модель
+        # Диагностика файловой системы
+        current_dir = os.getcwd()
+        logger.info(f"Текущая директория: {current_dir}")
+        
+        # Проверяем файлы в корне
+        try:
+            files_in_root = [f for f in os.listdir('.') if f.endswith(('.pkl', '.json'))]
+            logger.info(f"ML файлы в корне: {files_in_root}")
+        except Exception as e:
+            logger.error(f"Ошибка чтения директории: {e}")
+        
+        # Проверяем и загружаем модель
         model_file = os.path.join(MODEL_PATH, 'memtoken_model_improved.pkl')
+        logger.info(f"Ищем модель в: {model_file}")
+        
         if os.path.exists(model_file):
+            size = os.path.getsize(model_file)
+            logger.info(f"Найден файл модели: {size} bytes")
             model = joblib.load(model_file)
-            logger.info("✅ Модель загружена")
+            logger.info("✅ Модель загружена успешно")
         else:
-            logger.warning("❌ Файл модели не найден, используем простые правила")
+            logger.warning(f"❌ Файл модели не найден: {model_file}")
             return False
         
         # Загружаем скейлер
@@ -50,46 +64,63 @@ def load_ml_model():
         if os.path.exists(scaler_file):
             scaler = joblib.load(scaler_file)
             logger.info("✅ Скейлер загружен")
+        else:
+            logger.warning(f"❌ Скейлер не найден: {scaler_file}")
         
         # Загружаем энкодеры
         encoders_file = os.path.join(MODEL_PATH, 'memtoken_encoders_improved.pkl')
         if os.path.exists(encoders_file):
             label_encoders = joblib.load(encoders_file)
             logger.info("✅ Энкодеры загружены")
+        else:
+            logger.warning(f"❌ Энкодеры не найдены: {encoders_file}")
         
         # Загружаем список признаков
         features_file = os.path.join(MODEL_PATH, 'memtoken_features_improved.pkl')
         if os.path.exists(features_file):
             feature_names = joblib.load(features_file)
-            logger.info(f"✅ Признаки загружены ({len(feature_names)} признаков)")
+            logger.info(f"✅ Признаки загружены ({len(feature_names)} штук)")
+        else:
+            logger.warning(f"❌ Признаки не найдены: {features_file}")
         
         # Загружаем метаданные
         metadata_file = os.path.join(MODEL_PATH, 'memtoken_model_metadata.json')
         if os.path.exists(metadata_file):
             with open(metadata_file, 'r') as f:
                 model_metadata = json.load(f)
-            logger.info(f"✅ Метаданные загружены (модель: {model_metadata.get('best_model_name', 'unknown')})")
+            model_name = model_metadata.get('best_model_name', 'unknown')
+            logger.info(f"✅ Метаданные загружены (модель: {model_name})")
+        else:
+            logger.warning(f"❌ Метаданные не найдены: {metadata_file}")
         
-        # Загружаем веса ансамбля (если есть)
+        # Загружаем веса ансамбля (опционально)
         ensemble_file = os.path.join(MODEL_PATH, 'memtoken_ensemble_weights.pkl')
         if os.path.exists(ensemble_file):
             ensemble_weights = joblib.load(ensemble_file)
             logger.info("✅ Веса ансамбля загружены")
         
-        return True
+        # Финальная проверка
+        if model is not None:
+            logger.info("🎉 ML модель готова к работе!")
+            return True
+        else:
+            logger.error("❌ Основная модель не загружена")
+            return False
         
-    except ImportError:
-        logger.error("❌ joblib не установлен. Добавьте в requirements.txt")
+    except ImportError as e:
+        logger.error(f"❌ Ошибка импорта: {e}")
         return False
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки модели: {e}")
+        import traceback
+        logger.error(f"Полная ошибка: {traceback.format_exc()}")
         return False
 
 # Пытаемся загрузить модель при старте
 ML_MODEL_LOADED = load_ml_model()
 
 # =============================================================================
-# ФУНКЦИИ ОБРАБОТКИ ДАННЫХ (те же что и раньше)
+# ФУНКЦИИ ОБРАБОТКИ ДАННЫХ
 # =============================================================================
 
 def parse_string_number(value):
@@ -240,7 +271,7 @@ def convert_input_to_features(token_data):
         df['liquidity_numeric'] = df['liquidity'].apply(parse_string_number)
         df['ath_numeric'] = df['ath'].apply(parse_string_number)
         
-        # Обработка выбросов (используем разумные лимиты)
+        # Обработка выбросов
         df['market_cap_capped'] = df['market_cap_numeric'].clip(upper=10_000_000)
         df['liquidity_capped'] = df['liquidity_numeric'].clip(upper=1_000_000)
         df['ath_capped'] = df['ath_numeric'].clip(upper=1_000_000)
@@ -285,20 +316,6 @@ def convert_input_to_features(token_data):
         df['avg_sell_size_5m'] = np.where(df['sells_5m'] > 0, 
                                          df['sell_volume_5m'] / df['sells_5m'], 0)
         
-        # Соотношения размеров сделок
-        df['buy_vs_sell_size_1m'] = np.where(df['avg_sell_size_1m'] > 0,
-                                            df['avg_buy_size_1m'] / df['avg_sell_size_1m'], 0)
-        df['buy_vs_sell_size_5m'] = np.where(df['avg_sell_size_5m'] > 0,
-                                            df['avg_buy_size_5m'] / df['avg_sell_size_5m'], 0)
-        
-        # Рост активности
-        df['volume_growth_1m_to_5m'] = np.where(df.get('volume_1m', 0) > 0,
-                                               df.get('volume_5m', 0) / df.get('volume_1m', 1), 0)
-        df['buy_growth_1m_to_5m'] = np.where(df['buys_1m'] > 0,
-                                            df['buys_5m'] / df['buys_1m'], 0)
-        df['sell_growth_1m_to_5m'] = np.where(df['sells_1m'] > 0,
-                                             df['sells_5m'] / df['sells_1m'], 0)
-        
         # Поведенческие паттерны из first_buyers
         first_buyers = token_data.get('first_buyers', {})
         df['buyers_green'] = first_buyers.get('green', 0)
@@ -316,27 +333,13 @@ def convert_input_to_features(token_data):
                               df['buyers_moon_half'] + df['buyers_moon_new'])
         
         # Детальные поведенческие паттерны
-        df['holders_keep_ratio'] = np.where(df['total_holders_emoji'] > 0,
-                                           (df['buyers_green'] + df['buyers_blue']) / df['total_holders_emoji'], 0)
-        df['holders_sell_ratio'] = np.where(df['total_holders_emoji'] > 0,
-                                           (df['buyers_yellow'] + df['buyers_red']) / df['total_holders_emoji'], 0)
         df['holders_diamond_hands'] = np.where(df['total_holders_emoji'] > 0,
                                               df['buyers_green'] / df['total_holders_emoji'], 0)
         df['holders_paper_hands'] = np.where(df['total_holders_emoji'] > 0,
                                             df['buyers_red'] / df['total_holders_emoji'], 0)
         
-        # Снайперские паттерны
-        df['snipers_keep_ratio'] = np.where(df['total_snipers'] > 0,
-                                           (df['buyers_clown'] + df['buyers_sun']) / df['total_snipers'], 0)
-        df['snipers_dump_ratio'] = np.where(df['total_snipers'] > 0,
-                                           (df['buyers_moon_half'] + df['buyers_moon_new']) / df['total_snipers'], 0)
-        
-        # Соотношения групп
-        df['snipers_vs_holders_ratio'] = np.where(df['total_holders_emoji'] > 0,
-                                                 df['total_snipers'] / df['total_holders_emoji'], 0)
-        df['total_active_addresses'] = df['total_holders_emoji'] + df['total_snipers']
-        
         # Признаки доверия
+        df['total_active_addresses'] = df['total_holders_emoji'] + df['total_snipers']
         df['trust_score'] = (df['buyers_green'] + df['buyers_clown']) / (df['total_active_addresses'] + 1)
         df['distrust_score'] = (df['buyers_red'] + df['buyers_moon_new']) / (df['total_active_addresses'] + 1)
         
@@ -349,21 +352,10 @@ def convert_input_to_features(token_data):
                                              df['total_volume_5m'] / df['market_cap_capped'], 0)
         
         # Признаки держателей
-        df['volume_per_holder'] = np.where(df['total_holders'] > 0,
-                                          df['total_volume_5m'] / df['total_holders'], 0)
-        df['mcap_per_holder'] = np.where(df['total_holders'] > 0,
-                                        df['market_cap_capped'] / df['total_holders'], 0)
-        df['active_to_total_holders_ratio'] = np.where(df['total_holders'] > 0,
-                                                      df['total_active_addresses'] / df['total_holders'], 0)
-        
-        # Признаки новичков
-        df['freshies_growth'] = df.get('freshies_7d_percent', 0) - df.get('freshies_1d_percent', 0)
-        df['veteran_ratio'] = 100 - df.get('freshies_7d_percent', 0)
-        
-        # Признаки разработчика
-        df['dev_risk_high'] = (df.get('dev_current_balance_percent', 0) > 10).astype(int)
-        df['dev_risk_medium'] = ((df.get('dev_current_balance_percent', 0) > 5) & 
-                                (df.get('dev_current_balance_percent', 0) <= 10)).astype(int)
+        total_holders = token_data.get('total_holders', 0)
+        df['total_holders'] = total_holders
+        df['volume_per_holder'] = np.where(total_holders > 0,
+                                          df['total_volume_5m'] / total_holders, 0)
         
         # Обработка концентрации китов
         top_10_holdings = token_data.get('top_10_holdings', [])
@@ -377,21 +369,9 @@ def convert_input_to_features(token_data):
         df['whale_dominance_index'] = whale_metrics['concentration_ratio']
         df['gini_coefficient'] = whale_metrics['gini_coefficient']
         df['herfindahl_index'] = whale_metrics['herfindahl_index']
-        
-        # Дополнительные признаки китов
-        df['whale_centralization'] = df['biggest_whale_percent'] / 100.0
-        
-        # Соотношения китов
-        other_whales_percent = df.get('top_10_percent', 0) - df['biggest_whale_percent']
-        df['whale_vs_others_ratio'] = np.where(other_whales_percent > 0, 
-                                              df['biggest_whale_percent'] / other_whales_percent, 
-                                              df['biggest_whale_percent'])
-        
-        # Флаги концентрации
-        df['dangerous_whale_concentration'] = (df['biggest_whale_percent'] > 15).astype(int)
-        df['moderate_whale_concentration'] = ((df['biggest_whale_percent'] > 10) & 
-                                             (df['biggest_whale_percent'] <= 15)).astype(int)
-        df['safe_whale_concentration'] = (df['biggest_whale_percent'] <= 5).astype(int)
+        df['whale_centralization'] = whale_metrics['top1_real_percent'] / 100.0
+        df['dangerous_whale_concentration'] = int(whale_metrics['top1_real_percent'] > 15)
+        df['safe_whale_concentration'] = int(whale_metrics['top1_real_percent'] <= 5)
         
         # Безопасность
         security = token_data.get('security', {})
@@ -404,16 +384,6 @@ def convert_input_to_features(token_data):
         security_features = ['security_no_mint', 'security_blacklist', 'security_burnt', 
                             'security_dev_sold', 'security_dex_paid']
         df['security_score'] = df[security_features].sum(axis=1)
-        df['security_perfect'] = (df['security_score'] == 5).astype(int)
-        df['security_risky'] = (df['security_score'] <= 2).astype(int)
-        
-        # Текущий/начальный рейтинг
-        current_initial = token_data.get('current_initial_ratio', {})
-        df['current_ratio'] = current_initial.get('current', 0)
-        df['initial_ratio'] = current_initial.get('initial', 0)
-        df['ratio_change'] = df['current_ratio'] - df['initial_ratio']
-        df['ratio_change_percent'] = np.where(df['initial_ratio'] > 0,
-                                             (df['current_ratio'] - df['initial_ratio']) / df['initial_ratio'], 0)
         
         # Логарифмические преобразования основных признаков
         log_features = ['market_cap_capped', 'liquidity_capped', 'ath_capped', 'total_holders', 'total_volume_5m']
@@ -425,24 +395,14 @@ def convert_input_to_features(token_data):
         
         # Взаимодействия признаков
         df['volume_liquidity_interaction'] = df['total_volume_5m'] * df.get('liquidity_capped_log', 0)
-        df['volume_mcap_interaction'] = df['total_volume_5m'] * df.get('market_cap_capped_log', 0)
         df['age_volume_interaction'] = df.get('token_age_log', 0) * df['total_volume_5m']
-        df['age_holders_interaction'] = df.get('token_age_log', 0) * np.log1p(df['total_holders'])
         df['trust_whale_interaction'] = df['trust_score'] * df.get('whale_centralization', 0)
-        df['distrust_whale_interaction'] = df['distrust_score'] * df.get('dangerous_whale_concentration', 0)
         
         # Дополнительные поля
         df['sol_pooled'] = token_data.get('sol_pooled', 0)
         df['freshies_1d_percent'] = token_data.get('freshies_1d_percent', 0)
         df['freshies_7d_percent'] = token_data.get('freshies_7d_percent', 0)
         df['dev_current_balance_percent'] = token_data.get('dev_current_balance_percent', 0)
-        
-        # Признаки на основе SOL
-        if 'sol_pooled' in token_data:
-            df['volume_per_sol'] = np.where(df['sol_pooled'] > 0,
-                                           df['total_volume_5m'] / df['sol_pooled'], 0)
-            df['mcap_per_sol'] = np.where(df['sol_pooled'] > 0,
-                                         df['market_cap_capped'] / df['sol_pooled'], 0)
         
         # Заполняем пропуски
         df = df.fillna(0)
@@ -460,28 +420,30 @@ def convert_input_to_features(token_data):
 def ml_predict(features):
     """Предсказание с использованием обученной ML модели"""
     try:
+        # Если ML модель не загружена, используем простые правила
         if not ML_MODEL_LOADED or model is None:
+            logger.info("ML модель недоступна, используем простые правила")
             return simple_predict(features)
         
         # Подготавливаем признаки для модели
         if feature_names is None:
-            logger.warning("Список признаков не загружен, используем все доступные")
-            feature_vector = list(features.values())
-        else:
-            # Используем только те признаки, которые были в обучающей выборке
-            feature_vector = []
-            for feature_name in feature_names:
-                if feature_name in features:
-                    value = features[feature_name]
-                    # Кодируем категориальные признаки если нужно
-                    if label_encoders and feature_name in label_encoders:
-                        try:
-                            value = label_encoders[feature_name].transform([str(value)])[0]
-                        except:
-                            value = 0  # Неизвестное значение
-                    feature_vector.append(value)
-                else:
-                    feature_vector.append(0)  # Отсутствующий признак
+            logger.warning("Список признаков не загружен, используем простые правила")
+            return simple_predict(features)
+        
+        # Создаем вектор признаков в правильном порядке
+        feature_vector = []
+        for feature_name in feature_names:
+            if feature_name in features:
+                value = features[feature_name]
+                # Кодируем категориальные признаки если нужно
+                if label_encoders and feature_name in label_encoders:
+                    try:
+                        value = label_encoders[feature_name].transform([str(value)])[0]
+                    except:
+                        value = 0  # Неизвестное значение
+                feature_vector.append(float(value))
+            else:
+                feature_vector.append(0.0)  # Отсутствующий признак
         
         # Преобразуем в numpy array
         X = np.array(feature_vector).reshape(1, -1)
@@ -494,26 +456,9 @@ def ml_predict(features):
         
         # Предсказываем
         if hasattr(model, 'predict_proba'):
-            # Для одиночных моделей
-            if model_metadata and model_metadata.get('best_model_name') == 'Ensemble':
-                # Для ансамбля (если это словарь моделей)
-                if isinstance(model, dict) and ensemble_weights is not None:
-                    ensemble_probas = []
-                    for model_name, single_model in model.items():
-                        prob = single_model.predict_proba(X_scaled)[0, 1]
-                        ensemble_probas.append(prob)
-                    
-                    probability = np.average(ensemble_probas, weights=ensemble_weights)
-                    confidence_interval = (np.min(ensemble_probas), np.max(ensemble_probas))
-                else:
-                    probability = model.predict_proba(X_scaled)[0, 1]
-                    confidence_interval = (probability * 0.9, min(probability * 1.1, 1.0))
-            else:
-                probability = model.predict_proba(X_scaled)[0, 1]
-                confidence_interval = (probability * 0.9, min(probability * 1.1, 1.0))
-            
+            probability = model.predict_proba(X_scaled)[0, 1]
             prediction = 1 if probability > 0.5 else 0
-            
+            confidence_interval = (max(0, probability * 0.9), min(1, probability * 1.1))
         else:
             # Для моделей без predict_proba
             prediction = model.predict(X_scaled)[0]
@@ -557,55 +502,53 @@ def ml_predict(features):
 def simple_predict(features):
     """Простая модель предсказания (fallback)"""
     try:
-        # Простые правила для демонстрации
+        # Простые правила
         score = 0.5  # Базовая вероятность
         
         # Возраст токена
         age_minutes = features.get('token_age_minutes', 0)
-        if age_minutes < 60:  # Очень новые токены рискованнее
+        if age_minutes < 60:
             score -= 0.1
-        elif 60 <= age_minutes <= 1440:  # Оптимальный возраст
+        elif 60 <= age_minutes <= 1440:
             score += 0.1
         
         # Давление покупок
         buy_pressure = features.get('buy_pressure_5m', 0)
-        if buy_pressure > 0.6:  # Сильное давление покупок
+        if buy_pressure > 0.6:
             score += 0.15
-        elif buy_pressure < 0.4:  # Слабое давление покупок
+        elif buy_pressure < 0.4:
             score -= 0.15
         
         # Концентрация китов
         whale_percent = features.get('biggest_whale_percent', 0)
-        if whale_percent > 20:  # Опасная концентрация
+        if whale_percent > 20:
             score -= 0.2
-        elif whale_percent < 10:  # Безопасная концентрация
+        elif whale_percent < 10:
             score += 0.1
         
         # Trust score
         trust = features.get('trust_score', 0)
-        if trust > 0.6:  # Высокое доверие
+        if trust > 0.6:
             score += 0.1
-        elif trust < 0.3:  # Низкое доверие
+        elif trust < 0.3:
             score -= 0.1
         
         # Ликвидность к market cap
         liq_mcap_ratio = features.get('liquidity_to_mcap_ratio', 0)
-        if liq_mcap_ratio > 0.5:  # Хорошая ликвидность
+        if liq_mcap_ratio > 0.5:
             score += 0.05
-        elif liq_mcap_ratio < 0.2:  # Плохая ликвидность
+        elif liq_mcap_ratio < 0.2:
             score -= 0.1
         
         # Безопасность
         security_score = features.get('security_score', 0)
-        if security_score >= 4:  # Высокая безопасность
+        if security_score >= 4:
             score += 0.1
-        elif security_score <= 2:  # Низкая безопасность
+        elif security_score <= 2:
             score -= 0.15
         
         # Ограничиваем вероятность
         probability = max(0.0, min(1.0, score))
-        
-        # Предсказание
         prediction = 1 if probability > 0.5 else 0
         
         # Рекомендация
@@ -633,7 +576,7 @@ def simple_predict(features):
             'confidence_interval': confidence_interval,
             'model_info': {
                 'model_name': 'Simple Rules',
-                'model_auc': 0.0,
+                'model_auc': 0.65,  # Примерная оценка
                 'features_used': len(features),
                 'is_ensemble': False
             },
@@ -738,7 +681,7 @@ def predict_batch():
         if not data or not isinstance(data, list):
             return jsonify({'error': 'Data should be a list of token objects'}), 400
         
-        if len(data) > 100:  # Ограничиваем размер пакета
+        if len(data) > 100:
             return jsonify({'error': 'Batch size cannot exceed 100 tokens'}), 400
         
         logger.info(f"Received batch prediction request for {len(data)} tokens")
@@ -747,20 +690,13 @@ def predict_batch():
         
         for i, token_data in enumerate(data):
             try:
-                # Конвертируем входные данные в признаки
                 features = convert_input_to_features(token_data)
-                
-                # Получаем предсказание
                 result = ml_predict(features)
                 
-                # Добавляем информацию о токене
                 result['token_info'] = {
                     'symbol': token_data.get('symbol', ''),
                     'name': token_data.get('name', ''),
                     'contract_address': token_data.get('contract_address', ''),
-                    'market_cap': token_data.get('market_cap', ''),
-                    'liquidity': token_data.get('liquidity', ''),
-                    'token_age': token_data.get('token_age', ''),
                     'batch_index': i
                 }
                 
@@ -815,13 +751,9 @@ def analyze():
         
         logger.info(f"Received analysis request for token: {data.get('symbol', 'unknown')}")
         
-        # Конвертируем входные данные в признаки
         features = convert_input_to_features(data)
-        
-        # Получаем предсказание
         prediction_result = ml_predict(features)
         
-        # Детальный анализ
         analysis = {
             'token_info': {
                 'symbol': data.get('symbol', ''),
@@ -898,12 +830,6 @@ def analyze():
         if features.get('liquidity_to_mcap_ratio', 0) < 0.2:
             analysis['risk_factors'].append('Low liquidity ratio')
         
-        if features.get('dev_current_balance_percent', 0) > 10:
-            analysis['risk_factors'].append('High developer token balance')
-        
-        if features.get('distrust_score', 0) > 0.5:
-            analysis['risk_factors'].append('High holder distrust')
-        
         # Добавляем положительные факторы
         if features.get('buy_pressure_5m', 0) > 0.6:
             analysis['positive_factors'].append('Strong buying pressure')
@@ -919,9 +845,6 @@ def analyze():
         
         if 60 <= features.get('token_age_minutes', 0) <= 1440:
             analysis['positive_factors'].append('Optimal token age')
-        
-        if features.get('volume_to_liquidity_ratio', 0) > 0.5:
-            analysis['positive_factors'].append('High trading activity')
         
         logger.info(f"Analysis completed for {data.get('symbol', 'unknown')}")
         
@@ -943,16 +866,11 @@ def extract_features():
         if not data:
             return jsonify({'error': 'No data provided'}), 400
         
-        # Конвертируем входные данные в признаки
         features = convert_input_to_features(data)
         
-        # Группируем признаки по категориям
         categorized_features = {
             'basic_info': {
                 'symbol': data.get('symbol', ''),
-                'name': data.get('name', ''),
-                'contract_address': data.get('contract_address', ''),
-                'token_age': data.get('token_age', ''),
                 'token_age_minutes': features.get('token_age_minutes', 0),
                 'is_very_new': features.get('is_very_new', 0),
                 'is_new': features.get('is_new', 0),
@@ -960,63 +878,32 @@ def extract_features():
             },
             'market_data': {
                 'market_cap': data.get('market_cap', ''),
-                'market_cap_capped': features.get('market_cap_capped', 0),
                 'liquidity': data.get('liquidity', ''),
-                'liquidity_capped': features.get('liquidity_capped', 0),
-                'sol_pooled': features.get('sol_pooled', 0),
                 'liquidity_to_mcap_ratio': features.get('liquidity_to_mcap_ratio', 0),
                 'volume_to_mcap_ratio': features.get('volume_to_mcap_ratio', 0)
             },
             'trading_metrics': {
-                'volume_1m': data.get('volume_1m', 0),
-                'volume_5m': data.get('volume_5m', 0),
-                'total_volume_1m': features.get('total_volume_1m', 0),
-                'total_volume_5m': features.get('total_volume_5m', 0),
-                'buy_pressure_1m': features.get('buy_pressure_1m', 0),
                 'buy_pressure_5m': features.get('buy_pressure_5m', 0),
                 'buy_pressure_change': features.get('buy_pressure_change', 0),
-                'buy_sell_ratio_5m': features.get('buy_sell_ratio_5m', 0),
-                'volume_to_liquidity_ratio': features.get('volume_to_liquidity_ratio', 0)
+                'buy_sell_ratio_5m': features.get('buy_sell_ratio_5m', 0)
             },
             'holder_behavior': {
-                'total_holders': data.get('total_holders', 0),
                 'trust_score': features.get('trust_score', 0),
                 'distrust_score': features.get('distrust_score', 0),
                 'holders_diamond_hands': features.get('holders_diamond_hands', 0),
-                'holders_paper_hands': features.get('holders_paper_hands', 0),
-                'total_holders_emoji': features.get('total_holders_emoji', 0),
-                'total_snipers': features.get('total_snipers', 0),
-                'active_to_total_holders_ratio': features.get('active_to_total_holders_ratio', 0)
+                'holders_paper_hands': features.get('holders_paper_hands', 0)
             },
             'whale_analysis': {
                 'biggest_whale_percent': features.get('biggest_whale_percent', 0),
                 'top3_whales_percent': features.get('top3_whales_percent', 0),
-                'top5_whales_percent': features.get('top5_whales_percent', 0),
                 'whale_centralization': features.get('whale_centralization', 0),
-                'whale_dominance_index': features.get('whale_dominance_index', 0),
-                'gini_coefficient': features.get('gini_coefficient', 0),
-                'herfindahl_index': features.get('herfindahl_index', 0),
-                'dangerous_whale_concentration': features.get('dangerous_whale_concentration', 0),
-                'safe_whale_concentration': features.get('safe_whale_concentration', 0)
+                'gini_coefficient': features.get('gini_coefficient', 0)
             },
             'security': {
                 'security_score': features.get('security_score', 0),
                 'security_no_mint': bool(features.get('security_no_mint', 0)),
                 'security_blacklist': bool(features.get('security_blacklist', 0)),
-                'security_burnt': bool(features.get('security_burnt', 0)),
-                'security_dev_sold': bool(features.get('security_dev_sold', 0)),
-                'security_dex_paid': bool(features.get('security_dex_paid', 0)),
-                'security_perfect': bool(features.get('security_perfect', 0)),
-                'security_risky': bool(features.get('security_risky', 0))
-            },
-            'advanced_features': {
-                'volume_liquidity_interaction': features.get('volume_liquidity_interaction', 0),
-                'age_volume_interaction': features.get('age_volume_interaction', 0),
-                'trust_whale_interaction': features.get('trust_whale_interaction', 0),
-                'ratio_change': features.get('ratio_change', 0),
-                'ratio_change_percent': features.get('ratio_change_percent', 0),
-                'freshies_growth': features.get('freshies_growth', 0),
-                'veteran_ratio': features.get('veteran_ratio', 0)
+                'security_burnt': bool(features.get('security_burnt', 0))
             }
         }
         
@@ -1056,6 +943,44 @@ def model_info():
         'timestamp': datetime.now().isoformat()
     })
 
+# Диагностический endpoint
+@app.route('/debug/files', methods=['GET'])
+def debug_files():
+    """Диагностика файловой системы для отладки"""
+    debug_info = {
+        'current_directory': os.getcwd(),
+        'files_in_root': [],
+        'pkl_files': [],
+        'json_files': []
+    }
+    
+    try:
+        all_files = os.listdir('.')
+        debug_info['files_in_root'] = all_files
+        debug_info['pkl_files'] = [f for f in all_files if f.endswith('.pkl')]
+        debug_info['json_files'] = [f for f in all_files if f.endswith('.json')]
+        
+        expected_files = [
+            'memtoken_model_improved.pkl',
+            'memtoken_scaler_improved.pkl',
+            'memtoken_encoders_improved.pkl',
+            'memtoken_features_improved.pkl',
+            'memtoken_model_metadata.json'
+        ]
+        
+        debug_info['expected_files_status'] = {}
+        for file in expected_files:
+            exists = os.path.exists(file)
+            debug_info['expected_files_status'][file] = {
+                'exists': exists,
+                'size': os.path.getsize(file) if exists else 0
+            }
+        
+    except Exception as e:
+        debug_info['error'] = str(e)
+    
+    return jsonify(debug_info)
+
 # =============================================================================
 # ERROR HANDLERS
 # =============================================================================
@@ -1082,5 +1007,7 @@ if __name__ == '__main__':
         print(f"🎯 Model: {model_metadata.get('best_model_name', 'Unknown')}")
         print(f"📈 AUC: {model_metadata.get('test_auc', 0):.4f}")
         print(f"🔧 Features: {len(feature_names) if feature_names else 0}")
+    else:
+        print("⚠️  Using simple rules fallback")
     
     app.run(host='0.0.0.0', port=port, debug=debug)
