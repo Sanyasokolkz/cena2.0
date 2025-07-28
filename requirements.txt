@@ -1,4 +1,5 @@
 flask
+gunicorn
 pandas
 numpy
 scikit-learn
@@ -7,3 +8,5 @@ xgboost
 catboost
 imbalanced-learn
 joblib
+# seaborn # Не нужен для работы API, только для визуализации
+# optuna # Не нужен для работы API, только для обучения
