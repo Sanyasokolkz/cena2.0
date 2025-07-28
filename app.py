@@ -19,7 +19,7 @@ CORS(app)
 # ЗАГРУЗКА ML МОДЕЛИ
 # =============================================================================
 
-MODEL_PATH = 'models/'
+MODEL_PATH = './'
 model = None
 scaler = None
 label_encoders = None
