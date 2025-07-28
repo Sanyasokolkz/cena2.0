@@ -1,3 +1,7 @@
+# =============================================================================
+# app.py - Исправленная версия с диагностикой модели
+# =============================================================================
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
@@ -9,7 +13,10 @@ from datetime import datetime
 import traceback
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -17,6 +24,7 @@ CORS(app)
 
 # Глобальная переменная для модели
 model_predictor = None
+model_load_error = None
 
 class SolanaTokenPredictor:
     """Класс для предсказания токенов Solana"""
@@ -188,7 +196,7 @@ class SolanaTokenPredictor:
     def predict(self, token_data, return_probability=True, return_confidence=False):
         """Предсказывает успешность токена"""
         if not self.is_trained:
-            raise ValueError("Модель не обучена")
+            raise ValueError("Model not trained")
         
         # Подготавливаем данные
         if isinstance(token_data, dict):
@@ -252,209 +260,94 @@ class SolanaTokenPredictor:
     def load_model(self, filepath):
         """Загружает сохраненную модель"""
         try:
+            logger.info(f"Attempting to load model from: {filepath}")
+            
+            if not os.path.exists(filepath):
+                raise FileNotFoundError(f"Model file not found: {filepath}")
+            
+            file_size = os.path.getsize(filepath) / (1024 * 1024)
+            logger.info(f"Model file size: {file_size:.1f}MB")
+            
             with open(filepath, 'rb') as f:
                 model_data = pickle.load(f)
+            
+            logger.info("Model data loaded successfully")
+            
+            # Проверяем структуру данных
+            required_keys = ['model', 'imputer', 'feature_names', 'is_trained']
+            missing_keys = [key for key in required_keys if key not in model_data]
+            
+            if missing_keys:
+                raise ValueError(f"Missing required keys in model data: {missing_keys}")
             
             self.model = model_data['model']
             self.imputer = model_data['imputer']
             self.feature_names = model_data['feature_names']
-            self.feature_importance = model_data['feature_importance']
-            self.model_metadata = model_data['model_metadata']
+            self.feature_importance = model_data.get('feature_importance', None)
+            self.model_metadata = model_data.get('model_metadata', {})
             self.is_trained = model_data['is_trained']
             
-            logger.info(f"Model loaded successfully: {filepath}")
+            logger.info(f"Model loaded successfully!")
+            logger.info(f"Features count: {len(self.feature_names)}")
+            logger.info(f"Model metadata: {self.model_metadata}")
+            
             return True
             
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
+            logger.error(traceback.format_exc())
             raise e
+
+def find_model_file():
+    """Ищет файл модели в различных возможных местах"""
+    possible_paths = [
+        "solana_model.pkl",
+        "./solana_model.pkl",
+        "solana_model_v2.pkl", 
+        "./solana_model_v2.pkl",
+        "model.pkl",
+        "./model.pkl",
+        os.path.join(os.path.dirname(__file__), 'solana_model.pkl'),
+        os.path.join(os.path.dirname(__file__), 'solana_model_v2.pkl')
+    ]
+    
+    logger.info("Searching for model file...")
+    logger.info(f"Current directory: {os.getcwd()}")
+    logger.info(f"Files in directory: {os.listdir('.')}")
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            logger.info(f"Found model file: {path}")
+            return path
+    
+    logger.error("No model file found in any of the expected locations")
+    return None
 
 def load_model():
     """Загружает модель при запуске приложения"""
-    global model_predictor
+    global model_predictor, model_load_error
     
     try:
-        model_predictor = SolanaTokenPredictor()
-        model_path = os.path.join(os.path.dirname(__file__), 'solana_model.pkl')
+        logger.info("Starting model loading process...")
         
-        if os.path.exists(model_path):
+        model_predictor = SolanaTokenPredictor()
+        
+        # Ищем файл модели
+        model_path = find_model_file()
+        
+        if model_path:
             model_predictor.load_model(model_path)
-            logger.info("Model loaded successfully on startup")
+            logger.info("✅ Model loaded successfully on startup")
         else:
-            logger.error(f"Model file not found: {model_path}")
+            model_load_error = "Model file not found"
+            logger.error("❌ Model file not found")
             
     except Exception as e:
-        logger.error(f"Failed to load model on startup: {str(e)}")
+        model_load_error = str(e)
+        logger.error(f"❌ Failed to load model on startup: {str(e)}")
+        logger.error(traceback.format_exc())
 
 @app.route('/', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
-        'status': 'healthy',
-        'service': 'Solana Token Predictor API',
-        'version': '1.0.0',
-        'model_loaded': model_predictor is not None and model_predictor.is_trained,
-        'timestamp': datetime.now().isoformat()
-    })
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    """Основной endpoint для предсказаний"""
-    try:
-        # Проверяем, что модель загружена
-        if model_predictor is None or not model_predictor.is_trained:
-            return jsonify({
-                'error': 'Model not loaded',
-                'message': 'The prediction model is not available'
-            }), 500
-        
-        # Получаем данные
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({
-                'error': 'No data provided',
-                'message': 'Please provide token data in JSON format'
-            }), 400
-        
-        # Выполняем предсказание
-        result = model_predictor.predict(data, return_confidence=True)
-        
-        # Формируем ответ
-        response = {
-            'success': True,
-            'data': result,
-            'timestamp': datetime.now().isoformat(),
-            'model_info': {
-                'version': model_predictor.model_metadata.get('training_date', 'unknown'),
-                'target_threshold': model_predictor.model_metadata.get('target_threshold', 2.0),
-                'test_auc': model_predictor.model_metadata.get('test_auc', 'unknown')
-            }
-        }
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
-        logger.error(traceback.format_exc())
-        
-        return jsonify({
-            'error': 'Prediction failed',
-            'message': str(e),
-            'timestamp': datetime.now().isoformat()
-        }), 500
-
-@app.route('/predict/batch', methods=['POST'])
-def predict_batch():
-    """Batch prediction endpoint"""
-    try:
-        if model_predictor is None or not model_predictor.is_trained:
-            return jsonify({
-                'error': 'Model not loaded',
-                'message': 'The prediction model is not available'
-            }), 500
-        
-        data = request.get_json()
-        
-        if not data or not isinstance(data, list):
-            return jsonify({
-                'error': 'Invalid data format',
-                'message': 'Please provide an array of token data'
-            }), 400
-        
-        if len(data) > 100:
-            return jsonify({
-                'error': 'Too many requests',
-                'message': 'Maximum 100 tokens per batch request'
-            }), 400
-        
-        # Выполняем предсказания
-        results = []
-        for i, token_data in enumerate(data):
-            try:
-                result = model_predictor.predict(token_data, return_confidence=True)
-                result['index'] = i
-                results.append(result)
-            except Exception as e:
-                results.append({
-                    'index': i,
-                    'error': str(e),
-                    'prediction': 'ERROR'
-                })
-        
-        response = {
-            'success': True,
-            'data': results,
-            'total_processed': len(results),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        logger.error(f"Batch prediction error: {str(e)}")
-        
-        return jsonify({
-            'error': 'Batch prediction failed',
-            'message': str(e),
-            'timestamp': datetime.now().isoformat()
-        }), 500
-
-@app.route('/model/info', methods=['GET'])
-def model_info():
-    """Информация о модели"""
-    try:
-        if model_predictor is None or not model_predictor.is_trained:
-            return jsonify({
-                'error': 'Model not loaded'
-            }), 500
-        
-        # Топ-10 важных признаков
-        top_features = []
-        if model_predictor.feature_importance is not None:
-            top_10 = model_predictor.feature_importance.head(10)
-            top_features = [
-                {
-                    'feature': row['feature'],
-                    'importance': float(row['importance'])
-                }
-                for _, row in top_10.iterrows()
-            ]
-        
-        response = {
-            'model_metadata': model_predictor.model_metadata,
-            'feature_count': len(model_predictor.feature_names) if model_predictor.feature_names else 0,
-            'top_features': top_features,
-            'is_trained': model_predictor.is_trained
-        }
-        
-        return jsonify(response)
-        
-    except Exception as e:
-        logger.error(f"Model info error: {str(e)}")
-        return jsonify({
-            'error': 'Failed to get model info',
-            'message': str(e)
-        }), 500
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        'error': 'Endpoint not found',
-        'message': 'The requested endpoint does not exist'
-    }), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        'error': 'Internal server error',
-        'message': 'An unexpected error occurred'
-    }), 500
-
-if __name__ == '__main__':
-    # Загружаем модель при запуске
-    load_model()
-    
-    # Запускаем приложение
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port, debug=False)
