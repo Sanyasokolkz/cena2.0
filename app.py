@@ -1,815 +1,395 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import re
+import pickle
+import pandas as pd
+import numpy as np
 import logging
-import json
 import os
-from datetime import datetime
-import sys
-import warnings
-
-# Отключаем предупреждения
-warnings.filterwarnings('ignore')
-
-# === ФИКС ДЛЯ NUMPY._CORE ПРОБЛЕМЫ ===
-try:
-    import numpy as np
-    # Фикс для numpy._core ошибки
-    if not hasattr(np, '_core'):
-        try:
-            import numpy.core as _core
-            np._core = _core
-            sys.modules['numpy._core'] = _core
-        except:
-            pass
-    print("✅ Numpy loaded successfully")
-except Exception as e:
-    print(f"⚠️ Numpy import issue: {e}")
-    # Создаем заглушку для numpy если совсем не работает
-    class NumpyStub:
-        def __init__(self):
-            pass
-        def array(self, x):
-            return x
-        def log1p(self, x):
-            import math
-            return math.log1p(x) if isinstance(x, (int, float)) else x
-        def sqrt(self, x):
-            import math
-            return math.sqrt(x) if isinstance(x, (int, float)) else x
-        def where(self, condition, x, y):
-            return x if condition else y
-        def cumsum(self, x):
-            result = []
-            total = 0
-            for val in x:
-                total += val
-                result.append(total)
-            return result
-    np = NumpyStub()
-
-# Пытаемся импортировать pandas
-try:
-    import pandas as pd
-    print("✅ Pandas loaded successfully")
-except Exception as e:
-    print(f"⚠️ Pandas import issue: {e}")
-    # Создаем заглушку для pandas
-    class PandasStub:
-        def isna(self, x):
-            return x is None or x == '' or str(x).lower() == 'nan'
-        def DataFrame(self, data):
-            return {'data': data}
-    pd = PandasStub()
-
-# Настройка логирования
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+logging.basicConfig(level=logging.INFO)
 
-# =============================================================================
-# ЗАГЛУШКИ ДЛЯ ML МОДЕЛИ
-# =============================================================================
+# Загружаем модель при старте сервера
+try:
+    model_path = os.path.join(os.path.dirname(__file__), 'memtoken_model_improved.pkl')
+    with open(model_path, 'rb') as f:
+        model_artifacts = pickle.load(f)
+    print("✅ Модель загружена успешно!")
+except Exception as e:
+    print(f"❌ Ошибка загрузки модели: {e}")
+    model_artifacts = None
 
-MODEL_PATH = './'
-model = None
-scaler = None
-label_encoders = None
-feature_names = None
-model_metadata = None
-ensemble_weights = None
-
-def load_ml_model():
-    """Попытка загрузки ML модели с обработкой ошибок"""
-    global model, scaler, label_encoders, feature_names, model_metadata, ensemble_weights
-    
+def parse_token_data(text):
+    """
+    Парсит текстовые данные токена в структурированный формат
+    Оптимизирован для нового формата данных
+    """
     try:
-        # Пытаемся импортировать joblib
-        try:
-            import joblib
-            print("✅ Joblib imported successfully")
-        except ImportError:
-            print("❌ Joblib not available")
-            return False
+        token_data = {}
         
-        logger.info("Загружаем ML модель...")
-        
-        # Проверяем файлы
-        current_dir = os.getcwd()
-        logger.info(f"Текущая директория: {current_dir}")
-        
-        try:
-            files_in_root = [f for f in os.listdir('.') if f.endswith(('.pkl', '.json'))]
-            logger.info(f"ML файлы в корне: {files_in_root}")
-        except Exception as e:
-            logger.error(f"Ошибка чтения директории: {e}")
-            return False
-        
-        # Загружаем модель
-        model_file = os.path.join(MODEL_PATH, 'memtoken_model_improved.pkl')
-        if os.path.exists(model_file):
-            try:
-                size = os.path.getsize(model_file)
-                logger.info(f"Найден файл модели: {size} bytes")
-                model = joblib.load(model_file)
-                logger.info("✅ Модель загружена успешно")
-            except Exception as e:
-                logger.error(f"Ошибка загрузки модели: {e}")
-                return False
+        # Market Cap - "MC: $136.8K"
+        mcap_match = re.search(r'MC:\s*\$?([0-9,.]+)([KMB]?)', text, re.IGNORECASE)
+        if mcap_match:
+            value_str = mcap_match.group(1).replace(',', '')
+            value = float(value_str)
+            unit = mcap_match.group(2).upper()
+            if unit == 'K':
+                value *= 1000
+            elif unit == 'M':
+                value *= 1000000
+            elif unit == 'B':
+                value *= 1000000000
+            token_data['market_cap'] = value
         else:
-            logger.warning(f"❌ Файл модели не найден: {model_file}")
-            return False
+            token_data['market_cap'] = 0
         
-        # Загружаем остальные компоненты (опционально)
-        try:
-            scaler_file = os.path.join(MODEL_PATH, 'memtoken_scaler_improved.pkl')
-            if os.path.exists(scaler_file):
-                scaler = joblib.load(scaler_file)
-                logger.info("✅ Скейлер загружен")
-            
-            encoders_file = os.path.join(MODEL_PATH, 'memtoken_encoders_improved.pkl')
-            if os.path.exists(encoders_file):
-                label_encoders = joblib.load(encoders_file)
-                logger.info("✅ Энкодеры загружены")
-            
-            features_file = os.path.join(MODEL_PATH, 'memtoken_features_improved.pkl')
-            if os.path.exists(features_file):
-                feature_names = joblib.load(features_file)
-                logger.info(f"✅ Признаки загружены ({len(feature_names)} штук)")
-            
-            metadata_file = os.path.join(MODEL_PATH, 'memtoken_model_metadata.json')
-            if os.path.exists(metadata_file):
-                with open(metadata_file, 'r') as f:
-                    model_metadata = json.load(f)
-                model_name = model_metadata.get('best_model_name', 'unknown')
-                logger.info(f"✅ Метаданные загружены (модель: {model_name})")
-        
-        except Exception as e:
-            logger.warning(f"Некоторые компоненты не загружены: {e}")
-        
-        # Финальная проверка
-        if model is not None:
-            logger.info("🎉 ML модель готова к работе!")
-            return True
+        # Liquidity - "Liq: $42.4K"
+        liq_match = re.search(r'Liq:\s*\$?([0-9,.]+)([KMB]?)', text, re.IGNORECASE)
+        if liq_match:
+            value_str = liq_match.group(1).replace(',', '')
+            value = float(value_str)
+            unit = liq_match.group(2).upper()
+            if unit == 'K':
+                value *= 1000
+            elif unit == 'M':
+                value *= 1000000
+            elif unit == 'B':
+                value *= 1000000000
+            token_data['liquidity'] = value
         else:
-            logger.error("❌ Основная модель не загружена")
-            return False
+            token_data['liquidity'] = 0
+        
+        # Volume - берем 1min volume: "Volume: $12,129.12"
+        vol_1min_match = re.search(r'1 min:.*?Volume:\s*\$?([0-9,.]+)', text, re.DOTALL)
+        if vol_1min_match:
+            value_str = vol_1min_match.group(1).replace(',', '')
+            token_data['volume_1min'] = float(value_str)
+        else:
+            # Если нет 1min, берем 5min
+            vol_5min_match = re.search(r'5 min:.*?Volume:\s*\$?([0-9,.]+)', text, re.DOTALL)
+            if vol_5min_match:
+                value_str = vol_5min_match.group(1).replace(',', '')
+                token_data['volume_1min'] = float(value_str)
+            else:
+                token_data['volume_1min'] = 0
+        
+        # Last Volume - нет в новом формате, ставим значения по умолчанию
+        token_data['last_volume'] = token_data['volume_1min']  # Используем текущий объем
+        token_data['last_volume_multiplier'] = 1.0
+        
+        # Token Age - "Token age: 25m"
+        age_match = re.search(r'Token age:\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s\s*)?', text, re.IGNORECASE)
+        if age_match:
+            hours = int(age_match.group(1)) if age_match.group(1) else 0
+            minutes = int(age_match.group(2)) if age_match.group(2) else 0
+            seconds = int(age_match.group(3)) if age_match.group(3) else 0
+            total_minutes = hours * 60 + minutes + seconds / 60
+            token_data['token_age_numeric'] = total_minutes
+        else:
+            token_data['token_age_numeric'] = 0
+        
+        # Держатели по цветам - "🟢: 8 | 🔵: 5 | 🟡: 12 | ⭕️: 42"
+        holders_match = re.search(r'🟢:\s*(\d+)\s*\|\s*🔵:\s*(\d+)\s*\|\s*🟡:\s*(\d+)\s*\|\s*⭕️:\s*(\d+)', text)
+        if holders_match:
+            token_data['green_holders'] = int(holders_match.group(1))
+            token_data['blue_holders'] = int(holders_match.group(2))
+            token_data['yellow_holders'] = int(holders_match.group(3))
+            token_data['circle_holders'] = int(holders_match.group(4))
+        else:
+            token_data['green_holders'] = 0
+            token_data['blue_holders'] = 0
+            token_data['yellow_holders'] = 0
+            token_data['circle_holders'] = 0
+        
+        # Специальные держатели - "🤡: 0 | 🌞: 0 | 🌗: 0 | 🌚: 3"
+        special_holders_match = re.search(r'🤡:\s*(\d+)\s*\|\s*🌞:\s*(\d+)\s*\|\s*🌗:\s*(\d+)\s*\|\s*🌚:\s*(\d+)', text)
+        if special_holders_match:
+            token_data['clown_holders'] = int(special_holders_match.group(1))
+            token_data['sun_holders'] = int(special_holders_match.group(2))
+            token_data['half_moon_holders'] = int(special_holders_match.group(3))
+            token_data['dark_moon_holders'] = int(special_holders_match.group(4))
+        else:
+            token_data['clown_holders'] = 0
+            token_data['sun_holders'] = 0
+            token_data['half_moon_holders'] = 0
+            token_data['dark_moon_holders'] = 0
+        
+        # Total holders - "Total: 168"
+        total_holders_match = re.search(r'Total:\s*(\d+)', text)
+        if total_holders_match:
+            token_data['total_holders'] = int(total_holders_match.group(1))
+        else:
+            token_data['total_holders'] = (
+                token_data['green_holders'] + token_data['blue_holders'] + 
+                token_data['yellow_holders'] + token_data['circle_holders']
+            )
+        
+        # Top 10 percent - "Top 10: 23%"
+        top10_match = re.search(r'Top 10:\s*([0-9.]+)%', text)
+        if top10_match:
+            token_data['top10_percent'] = float(top10_match.group(1))
+        else:
+            token_data['top10_percent'] = 50.0
+        
+        # Current/Initial percentages - "Current/Initial: 16.76% / 98.87%"
+        current_initial_match = re.search(r'Current/Initial:\s*([0-9.]+)%\s*/\s*([0-9.]+)%', text)
+        if current_initial_match:
+            token_data['total_now_percent'] = float(current_initial_match.group(1))
+            token_data['total_percent'] = float(current_initial_match.group(2))
+        else:
+            token_data['total_percent'] = 100.0
+            token_data['total_now_percent'] = 50.0
+        
+        # Dev holds - "Dev current balance: 0%"
+        dev_match = re.search(r'Dev current balance:\s*([0-9.]+)%', text)
+        if dev_match:
+            token_data['dev_holds_percent'] = float(dev_match.group(1))
+        else:
+            token_data['dev_holds_percent'] = 0.0
+        
+        # Поля которых нет в новом формате - заполняем значениями по умолчанию
+        token_data['insiders_count'] = 0
+        token_data['insiders_percent'] = 0.0
+        token_data['snipers_count'] = 0
+        token_data['bundle_total'] = 0
+        token_data['bundle_supply_percent'] = 0.0
+        
+        # Создаем дополнительные признаки для модели
+        token_data['volume_to_liquidity'] = float(
+            np.log1p(token_data['volume_1min']) / np.log1p(token_data['liquidity'] + 1)
+            if token_data['liquidity'] > 0 else 0
+        )
+        
+        # Логарифмические признаки
+        token_data['log_market_cap'] = float(np.log1p(token_data['market_cap']))
+        token_data['log_liquidity'] = float(np.log1p(token_data['liquidity']))
+        token_data['log_volume_1min'] = float(np.log1p(token_data['volume_1min']))
+        token_data['log_last_volume'] = float(np.log1p(token_data['last_volume']))
+        
+        # Концентрация держателей
+        token_data['holder_concentration'] = int(
+            token_data['green_holders'] + token_data['blue_holders'] + 
+            token_data['yellow_holders'] + token_data['circle_holders']
+        )
+        
+        # Риск-индикаторы
+        token_data['total_risk_percent'] = float(
+            token_data['dev_holds_percent'] + token_data['insiders_percent']
+        )
+        
+        return convert_to_json_serializable(token_data)
         
     except Exception as e:
-        logger.error(f"❌ Общая ошибка загрузки модели: {e}")
-        return False
-
-# Пытаемся загрузить модель при старте
-ML_MODEL_LOADED = load_ml_model()
-
-# =============================================================================
-# ФУНКЦИИ ОБРАБОТКИ ДАННЫХ
-# =============================================================================
-
-def parse_string_number(value):
-    """Парсинг строковых чисел с K/M/B суффиксами"""
-    if pd.isna(value) or value == '' or value == 'N/A':
-        return 0
-    
-    if isinstance(value, (int, float)):
-        return float(value)
-    
-    value = str(value).upper().replace(',', '').strip()
-    value = re.sub(r'[^\d\.\-KMB]', '', value)
-    
-    if value == '' or value == '-':
-        return 0
-    
-    try:
-        if 'K' in value:
-            return float(value.replace('K', '')) * 1_000
-        elif 'M' in value:
-            return float(value.replace('M', '')) * 1_000_000
-        elif 'B' in value:
-            return float(value.replace('B', '')) * 1_000_000_000
-        else:
-            return float(value)
-    except:
-        return 0
-
-def parse_time_to_minutes(value):
-    """Парсинг времени в минуты"""
-    if pd.isna(value) or value == '' or value == 'N/A':
-        return 0
-    
-    if isinstance(value, (int, float)):
-        return float(value)
-    
-    total_minutes = 0
-    value = str(value).lower().strip()
-    
-    try:
-        # Дни
-        days = re.findall(r'(\d+(?:\.\d+)?)d', value)
-        if days:
-            total_minutes += float(days[0]) * 1440
-        
-        # Часы
-        hours = re.findall(r'(\d+(?:\.\d+)?)h', value)
-        if hours:
-            total_minutes += float(hours[0]) * 60
-        
-        # Минуты
-        minutes = re.findall(r'(\d+(?:\.\d+)?)m(?!s)', value)
-        if minutes:
-            total_minutes += float(minutes[0])
-        
-        # Секунды
-        seconds = re.findall(r'(\d+(?:\.\d+)?)s', value)
-        if seconds:
-            total_minutes += float(seconds[0]) / 60
-            
-        if total_minutes == 0:
-            clean_value = re.sub(r'[^\d\.]', '', value)
-            if clean_value:
-                total_minutes = float(clean_value)
-        
-        return total_minutes
-    except:
-        return 0
-
-def convert_input_to_features(token_data):
-    """Конвертирует входные данные в признаки (ИСПРАВЛЕННАЯ ВЕРСИЯ)"""
-    try:
-        features = {}
-        logger.info(f"Processing token: {token_data.get('symbol', 'unknown')}")
-        
-        # Базовая обработка рыночных данных
-        market_cap_str = token_data.get('market_cap', '0')
-        liquidity_str = token_data.get('liquidity', '0')
-        ath_str = token_data.get('ath', '0')
-        
-        features['market_cap_numeric'] = parse_string_number(market_cap_str)
-        features['liquidity_numeric'] = parse_string_number(liquidity_str)
-        features['ath_numeric'] = parse_string_number(ath_str)
-        
-        logger.info(f"Market cap: {market_cap_str} -> {features['market_cap_numeric']}")
-        logger.info(f"Liquidity: {liquidity_str} -> {features['liquidity_numeric']}")
-        logger.info(f"ATH: {ath_str} -> {features['ath_numeric']}")
-        
-        # Ограничиваем выбросы
-        features['market_cap_capped'] = min(features['market_cap_numeric'], 10_000_000)
-        features['liquidity_capped'] = min(features['liquidity_numeric'], 1_000_000)
-        features['ath_capped'] = min(features['ath_numeric'], 1_000_000)
-        
-        # Обработка времени
-        token_age_str = token_data.get('token_age', '0')
-        features['token_age_minutes'] = parse_time_to_minutes(token_age_str)
-        features['token_age_hours'] = features['token_age_minutes'] / 60
-        features['token_age_days'] = features['token_age_minutes'] / 1440
-        
-        logger.info(f"Token age: {token_age_str} -> {features['token_age_minutes']} minutes")
-        
-        # Категориальные признаки времени
-        features['is_very_new'] = 1 if features['token_age_minutes'] < 60 else 0
-        features['is_new'] = 1 if features['token_age_minutes'] < 1440 else 0
-        features['is_mature'] = 1 if features['token_age_minutes'] > 10080 else 0
-        
-        # Торговые паттерны - ИСПРАВЛЕННЫЕ ПОЛЯ
-        buy_volume_1m = float(token_data.get('buy_volume_1m', 0))
-        sell_volume_1m = float(token_data.get('sell_volume_1m', 0))
-        buy_volume_5m = float(token_data.get('buy_volume_5m', 0))
-        sell_volume_5m = float(token_data.get('sell_volume_5m', 0))
-        
-        features['total_volume_1m'] = buy_volume_1m + sell_volume_1m
-        features['total_volume_5m'] = buy_volume_5m + sell_volume_5m
-        
-        features['buy_sell_ratio_5m'] = buy_volume_5m / sell_volume_5m if sell_volume_5m > 0 else 0
-        features['buy_pressure_5m'] = buy_volume_5m / features['total_volume_5m'] if features['total_volume_5m'] > 0 else 0
-        
-        logger.info(f"Buy volume 5m: {buy_volume_5m}, Sell volume 5m: {sell_volume_5m}")
-        logger.info(f"Buy pressure 5m: {features['buy_pressure_5m']:.3f}")
-        
-        # Поведенческие паттерны - ИСПРАВЛЕННАЯ СТРУКТУРА
-        first_buyers = token_data.get('first_buyers', {})
-        buyers_green = first_buyers.get('green', 0)
-        buyers_blue = first_buyers.get('blue', 0)
-        buyers_yellow = first_buyers.get('yellow', 0)
-        buyers_red = first_buyers.get('red', 0)
-        buyers_clown = first_buyers.get('clown', 0)
-        buyers_moon_new = first_buyers.get('moon_new', 0)
-        
-        total_holders_emoji = buyers_green + buyers_blue + buyers_yellow + buyers_red
-        total_snipers = buyers_clown + first_buyers.get('sun', 0) + first_buyers.get('moon_half', 0) + buyers_moon_new
-        total_active = total_holders_emoji + total_snipers
-        
-        features['holders_diamond_hands'] = buyers_green / total_holders_emoji if total_holders_emoji > 0 else 0
-        features['holders_paper_hands'] = buyers_red / total_holders_emoji if total_holders_emoji > 0 else 0
-        features['trust_score'] = (buyers_green + buyers_clown) / (total_active + 1)
-        features['distrust_score'] = (buyers_red + buyers_moon_new) / (total_active + 1)
-        
-        logger.info(f"First buyers - Green: {buyers_green}, Red: {buyers_red}, Total: {total_active}")
-        logger.info(f"Trust score: {features['trust_score']:.3f}")
-        
-        # Рыночные коэффициенты
-        features['liquidity_to_mcap_ratio'] = features['liquidity_capped'] / features['market_cap_capped'] if features['market_cap_capped'] > 0 else 0
-        features['volume_to_liquidity_ratio'] = features['total_volume_5m'] / features['liquidity_capped'] if features['liquidity_capped'] > 0 else 0
-        
-        logger.info(f"Liquidity to mcap ratio: {features['liquidity_to_mcap_ratio']:.3f}")
-        
-        # Концентрация китов - ИСПРАВЛЕННАЯ ЛОГИКА
-        top_10_holdings = token_data.get('top_10_holdings', [])
-        if top_10_holdings and len(top_10_holdings) > 0:
-            features['biggest_whale_percent'] = float(top_10_holdings[0]) if top_10_holdings[0] else 0
-            features['top3_whales_percent'] = sum(float(x) for x in top_10_holdings[:3] if x)
-        else:
-            # Альтернативный способ через top_10_percent
-            top_10_percent = token_data.get('top_10_percent', 0)
-            features['biggest_whale_percent'] = float(top_10_percent) / 3 if top_10_percent else 0  # Примерная оценка
-            features['top3_whales_percent'] = float(top_10_percent) if top_10_percent else 0
-        
-        logger.info(f"Biggest whale: {features['biggest_whale_percent']:.1f}%")
-        
-        # Безопасность - ИСПРАВЛЕННАЯ ЛОГИКА
-        security = token_data.get('security', {})
-        security_score = 0
-        security_score += 1 if security.get('no_mint', False) else 0
-        security_score += 1 if security.get('blacklist', False) else 0
-        security_score += 1 if security.get('burnt', False) else 0
-        security_score += 1 if security.get('dev_sold', False) else 0
-        security_score += 1 if security.get('dex_paid', False) else 0
-        features['security_score'] = security_score
-        
-        logger.info(f"Security score: {security_score}/5")
-        
-        # Дополнительные поля
-        features['total_holders'] = float(token_data.get('total_holders', 0))
-        features['volume_per_holder'] = features['total_volume_5m'] / features['total_holders'] if features['total_holders'] > 0 else 0
-        
-        # Добавляем метрики активности
-        buys_5m = float(token_data.get('buys_5m', 0))
-        sells_5m = float(token_data.get('sells_5m', 0))
-        features['buy_sell_tx_ratio'] = buys_5m / sells_5m if sells_5m > 0 else 0
-        features['total_transactions_5m'] = buys_5m + sells_5m
-        
-        # Добавляем информацию о volatility
-        ath_change_percent = token_data.get('ath_change_percent', 0)
-        features['ath_change_percent'] = float(ath_change_percent) if ath_change_percent else 0
-        features['is_near_ath'] = 1 if abs(features['ath_change_percent']) < 10 else 0
-        
-        logger.info(f"Generated {len(features)} features")
-        
-        return features
-        
-    except Exception as e:
-        logger.error(f"Error converting features: {e}")
+        logging.error(f"Ошибка парсинга: {e}")
         return {}
 
-# =============================================================================
-# ФУНКЦИИ ПРЕДСКАЗАНИЯ
-# =============================================================================
+def convert_to_json_serializable(obj):
+    """Конвертирует numpy типы в стандартные Python типы для JSON"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_json_serializable(item) for item in obj]
+    else:
+        return obj
 
-def ml_predict(features):
-    """Предсказание с ML моделью или fallback на правила"""
+def predict_token_success(token_data):
+    """
+    Предсказывает успешность токена (с исправлением дрифта данных)
+    """
+    if model_artifacts is None:
+        return {'error': 'Модель не загружена'}
+    
     try:
-        # Если ML модель загружена, пытаемся её использовать
-        if ML_MODEL_LOADED and model is not None:
-            try:
-                # Простое предсказание без сложных преобразований
-                # Используем только базовые признаки
-                basic_features = [
-                    features.get('market_cap_capped', 0),
-                    features.get('liquidity_capped', 0),
-                    features.get('token_age_minutes', 0),
-                    features.get('buy_pressure_5m', 0),
-                    features.get('biggest_whale_percent', 0),
-                    features.get('trust_score', 0),
-                    features.get('security_score', 0),
-                    features.get('liquidity_to_mcap_ratio', 0)
-                ]
-                
-                # Нормализуем значения
-                X = [max(0, min(1000000, float(x))) for x in basic_features]
-                
-                if hasattr(model, 'predict_proba'):
-                    # Пытаемся предсказать вероятность
-                    try:
-                        probability = model.predict_proba([X])[0][1]
-                    except:
-                        # Если не получается, используем predict
-                        prediction = model.predict([X])[0]
-                        probability = 0.7 if prediction == 1 else 0.3
-                else:
-                    prediction = model.predict([X])[0]
-                    probability = 0.7 if prediction == 1 else 0.3
-                
-                prediction = 1 if probability > 0.5 else 0
-                
-                # Генерируем рекомендацию
-                if probability >= 0.75:
-                    recommendation = "🚀 STRONG BUY"
-                elif probability >= 0.65:
-                    recommendation = "✅ BUY"
-                elif probability >= 0.55:
-                    recommendation = "⚖️ CONSIDER"
-                elif probability >= 0.45:
-                    recommendation = "⚠️ CAUTION"
-                else:
-                    recommendation = "❌ AVOID"
-                
-                return {
-                    'probability': float(probability),
-                    'prediction': int(prediction),
-                    'recommendation': recommendation,
-                    'confidence_interval': (max(0, probability - 0.1), min(1, probability + 0.1)),
-                    'model_info': {
-                        'model_name': model_metadata.get('best_model_name', 'ML Model') if model_metadata else 'ML Model',
-                        'model_auc': model_metadata.get('test_auc', 0.75) if model_metadata else 0.75,
-                        'features_used': len(basic_features),
-                        'is_ensemble': False
-                    }
-                }
-                
-            except Exception as e:
-                logger.error(f"ML prediction failed: {e}")
-                # Fallback на простые правила
-                pass
+        # Создаем DataFrame
+        df_new = pd.DataFrame([token_data])
         
-        # Простые правила (fallback)
-        return simple_predict(features)
+        # Добавляем недостающие столбцы
+        for col in model_artifacts['feature_names']:
+            if col not in df_new.columns:
+                df_new[col] = 0
         
-    except Exception as e:
-        logger.error(f"Error in ml_predict: {e}")
-        return simple_predict(features)
-
-def simple_predict(features):
-    """Улучшенные правила предсказания"""
-    try:
-        score = 0.5  # Базовая вероятность
+        # Берем только нужные признаки в правильном порядке
+        df_new = df_new[model_artifacts['feature_names']]
         
-        # Возраст токена
-        age_minutes = features.get('token_age_minutes', 0)
-        if age_minutes < 60:
-            score -= 0.1  # Очень новые токены рискованнее (но не так сильно)
-        elif 60 <= age_minutes <= 1440:
-            score += 0.1   # Оптимальный возраст
-        elif age_minutes > 10080:
-            score -= 0.05  # Старые токены менее активны
+        # Применяем импутер
+        df_imputed = pd.DataFrame(
+            model_artifacts['imputer'].transform(df_new), 
+            columns=model_artifacts['feature_names']
+        )
         
-        # Давление покупок
-        buy_pressure = features.get('buy_pressure_5m', 0)
-        if buy_pressure > 0.65:
-            score += 0.2   # Сильное давление покупок
-        elif buy_pressure > 0.55:
-            score += 0.1   # Умеренное давление
-        elif buy_pressure < 0.35:
-            score -= 0.2   # Слабое давление
+        # Получаем исходные предсказания модели
+        raw_probability = float(model_artifacts['model'].predict_proba(df_imputed)[0, 1])
         
-        # Концентрация китов
-        whale_percent = features.get('biggest_whale_percent', 0)
-        if whale_percent > 25:
-            score -= 0.25  # Очень опасная концентрация
-        elif whale_percent > 15:
-            score -= 0.15  # Опасная концентрация
-        elif whale_percent < 8:
-            score += 0.1   # Безопасная концентрация
+        # 🔄 ИСПРАВЛЕНИЕ ДРИФТА: Инвертируем вероятность
+        probability = 1.0 - raw_probability
+        prediction = int(probability >= 0.5)
         
-        # Trust score
-        trust = features.get('trust_score', 0)
-        if trust > 0.7:
-            score += 0.15  # Высокое доверие
-        elif trust > 0.5:
-            score += 0.05  # Умеренное доверие
-        elif trust < 0.2:
-            score -= 0.15  # Низкое доверие
-        
-        # Ликвидность к market cap
-        liq_mcap_ratio = features.get('liquidity_to_mcap_ratio', 0)
-        if liq_mcap_ratio > 0.6:
-            score += 0.1   # Отличная ликвидность
-        elif liq_mcap_ratio > 0.3:
-            score += 0.05  # Хорошая ликвидность
-        elif liq_mcap_ratio < 0.15:
-            score -= 0.15  # Плохая ликвидность
-        
-        # Безопасность
-        security_score = features.get('security_score', 0)
-        if security_score >= 4:
-            score += 0.1   # Высокая безопасность
-        elif security_score >= 3:
-            score += 0.05  # Средняя безопасность
-        elif security_score <= 1:
-            score -= 0.2   # Низкая безопасность
-        
-        # Размер market cap (предпочитаем средние размеры)
-        mcap = features.get('market_cap_capped', 0)
-        if 50000 <= mcap <= 500000:  # Sweet spot
-            score += 0.05
-        elif mcap > 5000000:         # Слишком большие
-            score -= 0.05
-        elif mcap < 10000:           # Слишком маленькие
-            score -= 0.1
-        
-        # Активность транзакций
-        total_tx = features.get('total_transactions_5m', 0)
-        if total_tx > 500:  # Высокая активность
-            score += 0.05
-        elif total_tx < 50:  # Низкая активность
-            score -= 0.1
-        
-        # Соотношение покупок к продажам по транзакциям
-        tx_ratio = features.get('buy_sell_tx_ratio', 0)
-        if tx_ratio > 1.2:  # Больше покупательских транзакций
-            score += 0.05
-        elif tx_ratio < 0.8:  # Больше продажных транзакций
-            score -= 0.05
-        
-        # Ограничиваем вероятность
-        probability = max(0.05, min(0.95, score))
-        prediction = 1 if probability > 0.5 else 0
-        
-        # Рекомендация
-        if probability >= 0.8:
-            recommendation = "🔥 VERY STRONG BUY"
-        elif probability >= 0.7:
-            recommendation = "🚀 STRONG BUY" 
-        elif probability >= 0.6:
-            recommendation = "✅ BUY"
-        elif probability >= 0.5:
-            recommendation = "⚖️ CONSIDER"
-        elif probability >= 0.4:
-            recommendation = "⚠️ CAUTION"
-        elif probability >= 0.3:
-            recommendation = "❌ AVOID"
+        # Определяем уровень уверенности
+        confidence_score = abs(probability - 0.5) * 2
+        if confidence_score > 0.8:
+            confidence_level = "Очень высокая"
+        elif confidence_score > 0.6:
+            confidence_level = "Высокая"
+        elif confidence_score > 0.4:
+            confidence_level = "Средняя"
         else:
-            recommendation = "🚫 STRONG AVOID"
+            confidence_level = "Низкая"
         
-        return {
-            'probability': float(probability),
-            'prediction': int(prediction),
+        # Определяем рекомендацию
+        if probability >= 0.7:
+            recommendation = "ПОКУПАТЬ"
+            risk_level = "Низкий"
+        elif probability >= 0.5:
+            recommendation = "ИЗУЧИТЬ"
+            risk_level = "Средний"
+        else:
+            recommendation = "ПРОПУСТИТЬ"
+            risk_level = "Высокий"
+        
+        result = {
+            'prediction': 'ДА' if prediction == 1 else 'НЕТ',
+            'probability': round(float(probability), 4),
+            'probability_percent': f"{probability*100:.1f}%",
+            'confidence_level': confidence_level,
+            'confidence_score': round(float(confidence_score), 4),
             'recommendation': recommendation,
-            'confidence_interval': (max(0, probability - 0.1), min(1, probability + 0.1)),
+            'risk_level': risk_level,
+            'threshold_conservative': 'ДА' if probability >= 0.7 else 'НЕТ',
+            'threshold_optimal': 'ДА' if probability >= 0.5 else 'НЕТ',
+            'threshold_aggressive': 'ДА' if probability >= 0.3 else 'НЕТ',
+            
+            # Информация о коррекции для отладки
             'model_info': {
-                'model_name': 'Advanced Rules',
-                'model_auc': 0.68,
-                'features_used': len(features),
-                'is_ensemble': False
-            },
-            'key_factors': {
-                'age_minutes': age_minutes,
-                'buy_pressure_5m': buy_pressure,
-                'biggest_whale_percent': whale_percent,
-                'trust_score': trust,
-                'security_score': security_score,
-                'liquidity_to_mcap_ratio': liq_mcap_ratio,
-                'market_cap': mcap,
-                'total_transactions_5m': total_tx,
-                'buy_sell_tx_ratio': tx_ratio
+                'raw_probability': round(raw_probability, 4),
+                'corrected_probability': round(probability, 4),
+                'drift_correction': True,
+                'data_format': 'new_format_optimized'
             }
         }
         
+        return convert_to_json_serializable(result)
+        
     except Exception as e:
-        logger.error(f"Error in simple prediction: {e}")
-        return {
-            'probability': 0.5,
-            'prediction': 0,
-            'recommendation': "❓ ERROR",
-            'confidence_interval': (0.0, 1.0),
-            'model_info': {
-                'model_name': 'Error',
-                'model_auc': 0.0,
-                'features_used': 0,
-                'is_ensemble': False
-            },
-            'error': str(e)
-        }
+        logging.error(f"Ошибка предсказания: {e}")
+        return {'error': f'Ошибка предсказания: {str(e)}'}
 
-# =============================================================================
-# API ENDPOINTS
-# =============================================================================
-
-@app.route('/', methods=['GET'])
+@app.route('/health', methods=['GET'])
 def health_check():
-    """Проверка здоровья API"""
+    """Проверка работоспособности API"""
     return jsonify({
         'status': 'healthy',
-        'message': 'Memtoken Prediction API is running',
-        'timestamp': datetime.now().isoformat(),
-        'version': '1.1.0',
-        'ml_model_loaded': ML_MODEL_LOADED,
-        'model_info': {
-            'model_name': model_metadata.get('best_model_name', 'Advanced Rules') if model_metadata else 'Advanced Rules',
-            'model_auc': model_metadata.get('test_auc', 0.68) if model_metadata else 0.68,
-            'features_count': len(feature_names) if feature_names else 25,
-            'components_loaded': {
-                'model': model is not None,
-                'scaler': scaler is not None,
-                'encoders': label_encoders is not None,
-                'features': feature_names is not None,
-                'metadata': model_metadata is not None
-            }
-        }
+        'model_loaded': model_artifacts is not None,
+        'version': '2.1',
+        'optimized_for': 'new_data_format',
+        'drift_correction': 'enabled',
+        'environment': os.environ.get('RAILWAY_ENVIRONMENT', 'unknown')
     })
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """Предсказание для одного токена"""
+    """Основной эндпоинт для предсказания"""
     try:
         data = request.get_json()
         
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
+        if not data or 'text' not in data:
+            return jsonify({'error': 'Необходимо передать поле "text" с данными токена'}), 400
         
-        logger.info(f"Received prediction request for token: {data.get('symbol', 'unknown')}")
+        # Парсим текст
+        token_data = parse_token_data(data['text'])
         
-        # Конвертируем входные данные в признаки
-        features = convert_input_to_features(data)
-        
-        if not features:
-            return jsonify({'error': 'Failed to extract features from token data'}), 400
+        if not token_data:
+            return jsonify({'error': 'Не удалось распарсить данные токена'}), 400
         
         # Получаем предсказание
-        result = ml_predict(features)
+        result = predict_token_success(token_data)
         
-        # Добавляем информацию о токене
-        result['token_info'] = {
-            'symbol': data.get('symbol', ''),
-            'name': data.get('name', ''),
-            'contract_address': data.get('contract_address', ''),
-            'market_cap': data.get('market_cap', ''),
-            'liquidity': data.get('liquidity', ''),
-            'token_age': data.get('token_age', ''),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        logger.info(f"Prediction completed: {result['recommendation']} ({result['probability']:.3f})")
+        # Добавляем распарсенные данные для отладки
+        if data.get('include_parsed_data', False):
+            result['parsed_data'] = convert_to_json_serializable(token_data)
         
         return jsonify(result)
         
     except Exception as e:
-        logger.error(f"Error in predict endpoint: {e}")
-        return jsonify({
-            'error': 'Internal server error',
-            'message': str(e)
-        }), 500
-
-@app.route('/predict/batch', methods=['POST'])
-def predict_batch():
-    """Пакетное предсказание"""
-    try:
-        data = request.get_json()
-        
-        if not data or not isinstance(data, list):
-            return jsonify({'error': 'Data should be a list of token objects'}), 400
-        
-        if len(data) > 100:
-            return jsonify({'error': 'Batch size cannot exceed 100 tokens'}), 400
-        
-        results = []
-        
-        for i, token_data in enumerate(data):
-            try:
-                features = convert_input_to_features(token_data)
-                result = ml_predict(features)
-                
-                result['token_info'] = {
-                    'symbol': token_data.get('symbol', ''),
-                    'name': token_data.get('name', ''),
-                    'batch_index': i
-                }
-                
-                results.append(result)
-                
-            except Exception as e:
-                results.append({
-                    'error': f'Error processing token {i}',
-                    'message': str(e),
-                    'token_info': {'symbol': token_data.get('symbol', ''), 'batch_index': i}
-                })
-        
-        successful_predictions = [r for r in results if 'error' not in r]
-        avg_probability = sum(r['probability'] for r in successful_predictions) / len(successful_predictions) if successful_predictions else 0
-        
-        return jsonify({
-            'results': results,
-            'batch_stats': {
-                'total_tokens': len(data),
-                'successful_predictions': len(successful_predictions),
-                'average_probability': avg_probability,
-                'timestamp': datetime.now().isoformat()
-            }
-        })
-        
-    except Exception as e:
-        return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
-
-@app.route('/debug/features', methods=['POST'])
-def debug_features():
-    """Отладка: показать извлеченные признаки"""
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        features = convert_input_to_features(data)
-        
-        return jsonify({
-            'input_data': data,
-            'extracted_features': features,
-            'feature_count': len(features),
-            'timestamp': datetime.now().isoformat()
-        })
-        
-    except Exception as e:
-        return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
-
-@app.route('/debug/files', methods=['GET'])
-def debug_files():
-    """Диагностика файлов"""
-    try:
-        files_info = {
-            'current_directory': os.getcwd(),
-            'all_files': os.listdir('.'),
-            'pkl_files': [f for f in os.listdir('.') if f.endswith('.pkl')],
-            'json_files': [f for f in os.listdir('.') if f.endswith('.json')]
-        }
-        return jsonify(files_info)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logging.error(f"Ошибка API: {e}")
+        return jsonify({'error': f'Внутренняя ошибка сервера: {str(e)}'}), 500
 
 @app.route('/test', methods=['GET'])
-def test_with_sample():
-    """Тест с примером данных"""
-    sample_data = {
-        "symbol": "TEST",
-        "name": "Test Token",
-        "contract_address": "test123",
-        "token_age": "1h 30m",
-        "market_cap": "50K",
-        "liquidity": "35K",
-        "ath": "75K",
-        "buy_volume_5m": 15000,
-        "sell_volume_5m": 12000,
-        "buys_5m": 45,
-        "sells_5m": 35,
-        "first_buyers": {
-            "green": 8,
-            "blue": 5,
-            "yellow": 3,
-            "red": 12,
-            "clown": 1,
-            "moon_new": 2
-        },
-        "top_10_holdings": [15.5, 8.2, 6.1, 4.3, 3.8],
-        "total_holders": 150,
-        "security": {
-            "no_mint": True,
-            "blacklist": True,
-            "burnt": True,
-            "dev_sold": False,
-            "dex_paid": True
-        }
-    }
+def test():
+    """Тестовый эндпоинт с данными нового формата"""
+    test_text = """🎲 $PVE | President vs Elon
+
+3nuogKUQuxfxjCRud7Bpm5a9Q7eT7mxpFGNe9WeNbonk
+
+⏳ Token age:  25m  | 👁 14
+├ MC: $136.8K
+├ Liq: $42.4K / SOL pooled: 111.02
+└ ATH: $134.6K (-4% / 4s)
+
+1 min:
+├ Volume: $12,129.12
+├ Buy volume ($): $6,446.81
+├ Sell volume ($): $5,682.31
+├ Buys: 165
+└ Sells: 177
+
+5 min:
+├ Volume: $71,175.80
+├ Buy volume ($): $46,124.03
+├ Sell volume ($): $25,051.77
+├ Buys: 585
+└ Sells: 448
+
+🎯 First 70 buyers:
+🌚🌚🌚🟡🟡🟡🟡🟡🟡🟡
+🟡🟢🟡⭕️⭕️⭕️⭕️⭕️⭕️⭕️
+⭕️🟢🔵🔵🟢🟢⭕️🟡🟡⭕️
+⭕️⭕️⭕️⭕️⭕️⭕️⭕️⭕️⭕️⭕️
+⭕️⭕️⭕️⭕️⭕️⭕️⭕️⭕️🟢🟢
+🔵⭕️⭕️⭕️🟢🔵⭕️⭕️⭕️⭕️
+🔵⭕️⭕️⭕️🟢⭕️⭕️⭕️⭕️🟡
+
+├ 🟢: 8 | 🔵: 5 | 🟡: 12 | ⭕️: 42
+├ 🤡: 0 | 🌞: 0 | 🌗: 0 | 🌚: 3
+├ Current/Initial: 16.76% / 98.87%
+
+👥 Holders:
+├ Total: 168
+├ Freshies: 8.8% 1D | 87% 7D
+├ Top 10: 23%
+💰 Top 10 Holding (%)
+15.82 | 2.48 | 2.42 | 2.42 | 2.41 | 2.38 | 2.31 | 2.29 | 2.26 | 2.22
+
+😎 Dev
+├ Dev current balance: 0%
+└ Dev SOL balance: 0 SOL
+
+🔒 Security:
+├ NoMint: 🟢
+├ Blacklist: 🟢
+├ Burnt: 🟢
+├ Dev Sold: 🟢
+└ Dex Paid: 🔴"""
     
-    try:
-        features = convert_input_to_features(sample_data)
-        result = ml_predict(features)
-        
-        return jsonify({
-            'test_data': sample_data,
-            'features': features,
-            'prediction': result,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# =============================================================================
-# ERROR HANDLERS
-# =============================================================================
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
-
-# =============================================================================
-# MAIN
-# =============================================================================
+    token_data = parse_token_data(test_text)
+    result = predict_token_success(token_data)
+    result['parsed_data'] = convert_to_json_serializable(token_data)
+    
+    return jsonify(result)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
+    debug = os.environ.get('RAILWAY_ENVIRONMENT') != 'production'
     
-    print("🚀 Starting Memtoken Prediction API...")
-    print(f"📊 ML Model loaded: {'✅' if ML_MODEL_LOADED else '❌'}")
-    if ML_MODEL_LOADED and model_metadata:
-        print(f"🎯 Model: {model_metadata.get('best_model_name', 'Unknown')}")
-        print(f"📈 AUC: {model_metadata.get('test_auc', 0):.4f}")
-        print(f"🔧 Features: {len(feature_names) if feature_names else 0}")
-    else:
-        print("⚠️  Using Advanced Rules (AUC ~0.68)")
+    print("🚀 Token Prediction API v2.1")
+    print(f"📍 Порт: {port}")
+    print(f"🔄 Оптимизировано для нового формата данных")
+    print(f"🧪 Тест: /test")
+    print(f"❤️  Статус: /health")
     
     app.run(host='0.0.0.0', port=port, debug=debug)
