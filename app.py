@@ -1,5 +1,5 @@
 # =============================================================================
-# app.py - Исправленная версия с диагностикой модели
+# app.py - Финальная версия для Railway
 # =============================================================================
 
 from flask import Flask, request, jsonify
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# Глобальная переменная для модели
+# Глобальные переменные
 model_predictor = None
 model_load_error = None
 
@@ -232,7 +232,7 @@ class SolanaTokenPredictor:
             result = {
                 'prediction': 'SUCCESS' if prediction == 1 else 'FAIL',
                 'binary_prediction': int(prediction),
-                'expected_pnl_category': f'PNL >= {self.model_metadata["target_threshold"]}x' if prediction == 1 else f'PNL < {self.model_metadata["target_threshold"]}x'
+                'expected_pnl_category': f'PNL >= {self.model_metadata.get("target_threshold", 2.0)}x' if prediction == 1 else f'PNL < {self.model_metadata.get("target_threshold", 2.0)}x'
             }
             
             if return_probability:
@@ -301,19 +301,23 @@ class SolanaTokenPredictor:
 def find_model_file():
     """Ищет файл модели в различных возможных местах"""
     possible_paths = [
+        "solana_model_v2.pkl",
         "solana_model.pkl",
-        "./solana_model.pkl",
-        "solana_model_v2.pkl", 
         "./solana_model_v2.pkl",
+        "./solana_model.pkl",
         "model.pkl",
-        "./model.pkl",
-        os.path.join(os.path.dirname(__file__), 'solana_model.pkl'),
-        os.path.join(os.path.dirname(__file__), 'solana_model_v2.pkl')
+        "./model.pkl"
     ]
     
     logger.info("Searching for model file...")
     logger.info(f"Current directory: {os.getcwd()}")
-    logger.info(f"Files in directory: {os.listdir('.')}")
+    
+    try:
+        files_in_dir = os.listdir('.')
+        logger.info(f"Files in directory: {files_in_dir}")
+    except Exception as e:
+        logger.error(f"Error listing directory: {e}")
+        files_in_dir = []
     
     for path in possible_paths:
         if os.path.exists(path):
@@ -339,13 +343,17 @@ def load_model():
             model_predictor.load_model(model_path)
             logger.info("✅ Model loaded successfully on startup")
         else:
-            model_load_error = "Model file not found"
+            model_load_error = "Model file not found in directory"
             logger.error("❌ Model file not found")
             
     except Exception as e:
         model_load_error = str(e)
         logger.error(f"❌ Failed to load model on startup: {str(e)}")
         logger.error(traceback.format_exc())
+
+# =============================================================================
+# ROUTES (API ENDPOINTS)
+# =============================================================================
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -362,17 +370,25 @@ def health_check():
 @app.route('/debug', methods=['GET'])
 def debug_info():
     """Debug endpoint для диагностики"""
-    current_dir = os.getcwd()
-    files_in_dir = os.listdir('.')
-    
-    return jsonify({
-        'current_directory': current_dir,
-        'files_in_directory': files_in_dir,
-        'model_loaded': model_predictor is not None and model_predictor.is_trained,
-        'model_error': model_load_error,
-        'model_metadata': model_predictor.model_metadata if model_predictor and model_predictor.is_trained else None,
-        'feature_count': len(model_predictor.feature_names) if model_predictor and model_predictor.feature_names else 0
-    })
+    try:
+        current_dir = os.getcwd()
+        files_in_dir = os.listdir('.')
+        
+        return jsonify({
+            'current_directory': current_dir,
+            'files_in_directory': files_in_dir,
+            'model_loaded': model_predictor is not None and model_predictor.is_trained,
+            'model_error': model_load_error,
+            'model_metadata': model_predictor.model_metadata if model_predictor and model_predictor.is_trained else None,
+            'feature_count': len(model_predictor.feature_names) if model_predictor and model_predictor.feature_names else 0,
+            'python_version': os.sys.version,
+            'environment_vars': dict(os.environ)
+        })
+    except Exception as e:
+        return jsonify({
+            'error': 'Debug info failed',
+            'message': str(e)
+        }), 500
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -564,6 +580,10 @@ def internal_error(error):
         'error': 'Internal server error',
         'message': 'An unexpected error occurred'
     }), 500
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 if __name__ == '__main__':
     # Загружаем модель при запуске
