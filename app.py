@@ -1,13 +1,13 @@
-# app.py
 import os
 import pandas as pd
 import numpy as np
 import re
 import joblib
 import logging
+import json
 from flask import Flask, request, jsonify
 from datetime import datetime
-from sklearn.preprocessing import LabelEncoder
+# from sklearn.preprocessing import LabelEncoder # Не импортируем, так как используем сохраненный
 
 # --- Настройка логгирования ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -19,8 +19,8 @@ app = Flask(__name__)
 # --- Глобальные переменные для модели и компонентов ---
 model = None
 scaler = None
-encoders = None
-features = None
+encoders = None # В ноутбуке это label_encoders
+features = None # Список признаков
 model_name = None
 ensemble_weights = None
 
@@ -28,16 +28,24 @@ ensemble_weights = None
 
 def parse_string_number(value):
     """Улучшенная версия парсинга строковых чисел"""
+    # Преобразование массивов/серий в скаляр
+    if isinstance(value, (list, np.ndarray, pd.Series)):
+        if len(value) == 0:
+            value = '' # Если пустой, считаем как пустую строку
+        else:
+            # Берем первый элемент. Для Series используем iloc.
+            value = value[0] if not isinstance(value, pd.Series) else (value.iloc[0] if len(value) > 0 else '')
     if pd.isna(value) or value == '' or value == 'N/A' or value is None:
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
     value = str(value).upper().replace(',', '').strip()
-    value = re.sub(r'[^\d\.\-KMBkmb]', '', value) # Исправлено: добавлены строчные kmb
+    # Убираем символы валют и лишние символы
+    value = re.sub(r'[^\d\.\-KMBkmb]', '', value)
     if value == '' or value == '-':
         return 0.0
     try:
-        if 'K' in value or 'k' in value: # Исправлено: учет строчных
+        if 'K' in value or 'k' in value:
             return float(value.replace('K', '').replace('k', '')) * 1_000
         elif 'M' in value or 'm' in value:
             return float(value.replace('M', '').replace('m', '')) * 1_000_000
@@ -51,6 +59,12 @@ def parse_string_number(value):
 
 def parse_time_to_minutes(value):
     """Улучшенная версия парсинга времени"""
+    # Преобразование массивов/серий в скаляр
+    if isinstance(value, (list, np.ndarray, pd.Series)):
+        if len(value) == 0:
+            value = '' # Если пустой, считаем как пустую строку
+        else:
+            value = value[0] if not isinstance(value, pd.Series) else (value.iloc[0] if len(value) > 0 else '')
     if pd.isna(value) or value == '' or value == 'N/A' or value is None:
         return 0.0
     if isinstance(value, (int, float)):
@@ -58,18 +72,23 @@ def parse_time_to_minutes(value):
     total_minutes = 0.0
     value = str(value).lower().strip()
     try:
+        # Дни
         days = re.findall(r'(\d+(?:\.\d+)?)d', value)
         if days:
             total_minutes += float(days[0]) * 1440
+        # Часы
         hours = re.findall(r'(\d+(?:\.\d+)?)h', value)
         if hours:
             total_minutes += float(hours[0]) * 60
+        # Минуты
         minutes = re.findall(r'(\d+(?:\.\d+)?)m(?!s)', value)
         if minutes:
             total_minutes += float(minutes[0])
+        # Секунды
         seconds = re.findall(r'(\d+(?:\.\d+)?)s', value)
         if seconds:
             total_minutes += float(seconds[0]) / 60
+        # Если ничего не найдено
         if total_minutes == 0:
             clean_value = re.sub(r'[^\d\.]', '', value)
             if clean_value:
@@ -79,30 +98,47 @@ def parse_time_to_minutes(value):
          logger.warning(f"Ошибка парсинга времени '{value}': {e}")
          return 0.0
 
+# --- Исправленная функция parse_top10_holdings ---
 def parse_top10_holdings(value, total_top10_percent=None):
     """Улучшенная версия обработки концентрации китов с дополнительными метриками"""
-    if pd.isna(value) or value == '' or value == 'N/A' or value is None:
-        return {
-            'top1_real_percent': 0, 'top3_real_percent': 0, 'top5_real_percent': 0,
-            'concentration_ratio': 0, 'internal_distribution': [0]*10,
-            'gini_coefficient': 0, 'herfindahl_index': 0
-        }
-    try:
-        # Обработка как списка или строки
-        if isinstance(value, list):
-            internal_percentages = [float(x) for x in value if x is not None and not (isinstance(x, float) and np.isnan(x))]
-        elif isinstance(value, str):
-            value_clean = value.strip('[]').replace(' ', '')
-            if value_clean:
-                 internal_percentages = [float(x) for x in value_clean.split(',') if x.strip() and x.strip() != 'nan']
-            else:
-                 internal_percentages = []
+    # --- Исправление: Преобразование value в скаляр ---
+    # Проверяем, является ли value массивом или Series, и извлекаем первый элемент, если возможно
+    if isinstance(value, (list, np.ndarray, pd.Series)):
+        if len(value) == 0:
+             value_scalar = '' # Если пустой, считаем как пустую строку
         else:
-             internal_percentages = [float(value)] if not (isinstance(value, float) and np.isnan(value)) else []
+             # Берем первый элемент. Можно также использовать value.iloc[0] для Series.
+             # Важно: если value - это Series с индексом, iloc[0] безопаснее.
+             value_scalar = value[0] if not isinstance(value, pd.Series) else (value.iloc[0] if len(value) > 0 else '')
+    elif pd.isna(value) or value is None: # Проверка на pd.isna и None до str()
+         value_scalar = '' # Считаем NaN или None как пустую строку
+    else:
+         # Если это скаляр (строка, число), преобразуем в строку
+         value_scalar = str(value) 
+
+    # Теперь value_scalar точно скаляр. Проверяем его.
+    if value_scalar == '' or value_scalar == 'N/A' or value_scalar == 'nan':
+        return {
+            'top1_real_percent': 0.0, 'top3_real_percent': 0.0, 'top5_real_percent': 0.0,
+            'concentration_ratio': 0.0, 'internal_distribution': [0.0]*10,
+            'gini_coefficient': 0.0, 'herfindahl_index': 0.0
+        }
+    # --- Конец исправления ---
+    
+    try:
+        # Обработка как строки
+        value_clean = value_scalar.strip('[]').replace(' ', '') # Используем value_scalar
+        if value_clean:
+            # Фильтруем пустые и 'nan' значения
+            internal_percentages = [float(x) for x in value_clean.split(',') if x.strip() and x.strip().lower() != 'nan']
+        else:
+             internal_percentages = []
         
+        # Дополняем до 10 элементов нулями
         while len(internal_percentages) < 10:
             internal_percentages.append(0.0)
             
+        # Расчет реальных процентов
         if total_top10_percent is None or pd.isna(total_top10_percent) or total_top10_percent <= 0:
             real_percentages = internal_percentages
         else:
@@ -113,21 +149,30 @@ def parse_top10_holdings(value, total_top10_percent=None):
             else:
                 real_percentages = [0.0] * 10
 
+        # Основные метрики
         top1_real = real_percentages[0] if len(real_percentages) > 0 else 0.0
         top3_real = sum(real_percentages[:3]) if len(real_percentages) >= 3 else sum(real_percentages)
         top5_real = sum(real_percentages[:5]) if len(real_percentages) >= 5 else sum(real_percentages)
 
+        # Коэффициент концентрации
         total_internal_nonzero = sum([x for x in internal_percentages if x > 0])
         concentration_ratio = internal_percentages[0] / total_internal_nonzero if total_internal_nonzero > 0 else 0.0
 
+        # Коэффициент Джини (неравенство распределения)
         sorted_percentages = sorted([x for x in internal_percentages if x > 0], reverse=True)
         n = len(sorted_percentages)
         if n > 1:
             cumsum = np.cumsum(sorted_percentages)
-            gini_coefficient = (n + 1 - 2 * sum((n + 1 - i) * x for i, x in enumerate(cumsum))) / (n * sum(sorted_percentages)) if sum(sorted_percentages) > 0 else 0.0
+            # Проверка деления на ноль
+            total_sorted_sum = sum(sorted_percentages)
+            if total_sorted_sum > 0:
+                gini_coefficient = (n + 1 - 2 * sum((n + 1 - i) * x for i, x in enumerate(cumsum))) / (n * total_sorted_sum)
+            else:
+                gini_coefficient = 0.0
         else:
             gini_coefficient = 0.0
 
+        # Индекс Херфиндаля (концентрация рынка)
         total_sum = sum(internal_percentages)
         if total_sum > 0:
             herfindahl_index = sum((x / total_sum) ** 2 for x in internal_percentages if x > 0)
@@ -135,23 +180,24 @@ def parse_top10_holdings(value, total_top10_percent=None):
             herfindahl_index = 0.0
 
         return {
-            'top1_real_percent': top1_real,
-            'top3_real_percent': top3_real,
-            'top5_real_percent': top5_real,
-            'concentration_ratio': concentration_ratio,
-            'internal_distribution': internal_percentages,
-            'gini_coefficient': gini_coefficient,
-            'herfindahl_index': herfindahl_index
+            'top1_real_percent': float(top1_real),
+            'top3_real_percent': float(top3_real),
+            'top5_real_percent': float(top5_real),
+            'concentration_ratio': float(concentration_ratio),
+            'internal_distribution': [float(x) for x in internal_percentages],
+            'gini_coefficient': float(gini_coefficient),
+            'herfindahl_index': float(herfindahl_index)
         }
     except Exception as e:
-        logger.error(f"Ошибка в parse_top10_holdings для значения '{value}', total_top10_percent='{total_top10_percent}': {e}")
+        logger.error(f"Ошибка в parse_top10_holdings для значения '{value}' (scalar: '{value_scalar}'), total_top10_percent='{total_top10_percent}': {e}")
         return {
             'top1_real_percent': 0.0, 'top3_real_percent': 0.0, 'top5_real_percent': 0.0,
             'concentration_ratio': 0.0, 'internal_distribution': [0.0]*10,
             'gini_coefficient': 0.0, 'herfindahl_index': 0.0
         }
+# --- Конец исправленной функции ---
 
-# --- Функция предсказания ---
+# --- Функция предсказания (адаптирована из ячейки 18 ноутбука) ---
 def predict_memtoken_advanced(token_data):
     """
     Улучшенная функция предсказания успеха мемтокена
@@ -163,34 +209,47 @@ def predict_memtoken_advanced(token_data):
     global model, scaler, encoders, features, model_name, ensemble_weights
 
     if model is None or scaler is None or encoders is None or features is None:
-        return {"error": "Модель не загружена. Проверьте логи сервера."}
+        logger.error("Модель не загружена.")
+        return {
+            "success": False,
+            "error": "Модель не загружена. Проверьте логи сервера.",
+            "probability": 0.5,
+            "prediction": 0,
+            "recommendation": "❓ ОШИБКА - Модель не загружена",
+            "confidence_interval": [0.0, 1.0]
+        }
 
     try:
+        logger.debug(f"Начинаем обработку данных токена: {token_data}")
         # --- Подготовка DataFrame ---
         token_df = pd.DataFrame([token_data])
-        logger.debug(f"Входные данные: {token_data}")
         
-        # --- Обработка данных ---
+        # --- Обработка данных (как в ноутбуке) ---
         string_cols = ['market_cap', 'liquidity', 'ath']
         for col in string_cols:
             if col in token_df.columns:
+                logger.debug(f"Обработка столбца '{col}'")
                 token_df[col] = token_df[col].apply(parse_string_number)
-                # В API мы не ограничиваем выбросы, как в обучении, просто используем обработанное значение
-                # Если нужно ограничение, его нужно перенести сюда
+                # Используем фиксированные значения из обучающего датасета data, если они были сохранены
+                # В API мы просто копируем обработанное значение, так как у нас нет data
+                # В реальном применении можно сохранить q99 при обучении
+                # В ноутбуке использовалось q99 из обучающего сета, здесь просто копируем
                 token_df[f'{col}_capped'] = token_df[col] 
 
         if 'token_age' in token_df.columns:
+            logger.debug("Обработка столбца 'token_age'")
             token_df['token_age_minutes'] = token_df['token_age'].apply(parse_time_to_minutes)
             token_df['token_age_hours'] = token_df['token_age_minutes'] / 60
             token_df['token_age_days'] = token_df['token_age_minutes'] / 1440
             token_df['is_very_new'] = (token_df['token_age_minutes'] < 60).astype(int)
             token_df['is_new'] = (token_df['token_age_minutes'] < 1440).astype(int)
             token_df['is_mature'] = (token_df['token_age_minutes'] > 10080).astype(int)
-            token_df['is_very_mature'] = (token_df['token_age_minutes'] > 43200).astype(int)
+            token_df['is_very_mature'] = (token_df['token_age_minutes'] > 43200).astype(int)  # > 30 дней
             token_df['token_age_log'] = np.log1p(token_df['token_age_minutes'])
             token_df['token_age_sqrt'] = np.sqrt(token_df['token_age_minutes'])
 
         if 'top_10_holdings' in token_df.columns:
+             logger.debug("Обработка столбца 'top_10_holdings'")
              # top_10_percent не всегда нужен, если он есть, используем
              top10_total = token_data.get('top_10_percent', None) # Получаем из исходных данных
              holdings_str = token_data.get('top_10_holdings', '') # Получаем из исходных данных
@@ -204,7 +263,8 @@ def predict_memtoken_advanced(token_data):
              for i in range(10):
                  token_df[f'whale_{i+1}_internal_share'] = metrics['internal_distribution'][i]
 
-        # --- Создание признаков ---
+        # --- Создание признаков (как в ноутбуке) ---
+        logger.debug("Создание признаков...")
         # Торговые паттерны
         token_df['buy_sell_ratio_1m'] = np.where(token_df['sell_volume_1m'] > 0, 
                                                token_df['buy_volume_1m'] / token_df['sell_volume_1m'], 0)
@@ -238,6 +298,7 @@ def predict_memtoken_advanced(token_data):
 
         # Поведенческие паттерны (предполагаем, что данные приходят в "плоском" виде)
         # Если они приходят во вложенном виде, это обрабатывается в /predict
+        logger.debug("Создание поведенческих признаков...")
         token_df['total_holders_emoji'] = (token_df.get('buyers_green', 0) + token_df.get('buyers_blue', 0) + 
                                          token_df.get('buyers_yellow', 0) + token_df.get('buyers_red', 0))
         token_df['total_snipers'] = (token_df.get('buyers_clown', 0) + token_df.get('buyers_sun', 0) + 
@@ -261,6 +322,7 @@ def predict_memtoken_advanced(token_data):
         token_df['distrust_score'] = (token_df.get('buyers_red', 0) + token_df.get('buyers_moon_new', 0)) / (token_df['total_active_addresses'] + 1)
 
         # Рыночные коэффициенты
+        logger.debug("Создание рыночных коэффициентов...")
         token_df['liquidity_to_mcap_ratio'] = np.where(token_df.get('market_cap_capped', 0) > 0,
                                                      token_df.get('liquidity_capped', 0) / token_df['market_cap_capped'], 0)
         token_df['volume_to_liquidity_ratio'] = np.where(token_df.get('liquidity_capped', 0) > 0,
@@ -278,6 +340,7 @@ def predict_memtoken_advanced(token_data):
                                         (token_df.get('current_ratio', 0) - token_df.get('initial_ratio', 0)) / token_df['initial_ratio'], 0)
 
         # Концентрация и держатели
+        logger.debug("Создание признаков концентрации...")
         if 'total_holders' in token_df.columns:
             token_df['volume_per_holder'] = np.where(token_df['total_holders'] > 0,
                                          token_df['total_volume_5m'] / token_df['total_holders'], 0)
@@ -296,8 +359,10 @@ def predict_memtoken_advanced(token_data):
                                (token_df['dev_current_balance_percent'] <= 10)).astype(int)
 
         # Безопасность
+        logger.debug("Создание признаков безопасности...")
         security_features = ['security_no_mint', 'security_blacklist', 'security_burnt', 
                             'security_dev_sold', 'security_dex_paid']
+        # Убедимся, что колонки существуют
         for sf in security_features:
              if sf not in token_df.columns:
                   token_df[sf] = 0 # или False для булевых
@@ -307,6 +372,7 @@ def predict_memtoken_advanced(token_data):
         token_df['security_risky'] = (token_df['security_score'] <= 2).astype(int)
 
         # Логарифмические преобразования
+        logger.debug("Создание логарифмических преобразований...")
         log_features = ['market_cap_capped', 'liquidity_capped', 'ath_capped', 'total_holders', 'total_volume_5m', 'sol_pooled']
         for col in log_features:
             if col in token_df.columns:
@@ -315,14 +381,18 @@ def predict_memtoken_advanced(token_data):
                 token_df[f'{col}_inv'] = 1 / (token_df[col].fillna(0) + 1)
 
         # Взаимодействия признаков
+        logger.debug("Создание взаимодействий признаков...")
         token_df['volume_liquidity_interaction'] = token_df['total_volume_5m'] * token_df.get('liquidity_capped_log', 0)
         token_df['volume_mcap_interaction'] = token_df['total_volume_5m'] * token_df.get('market_cap_capped_log', 0)
         token_df['age_volume_interaction'] = token_df.get('token_age_log', 0) * token_df['total_volume_5m']
         token_df['age_holders_interaction'] = token_df.get('token_age_log', 0) * np.log1p(token_df.get('total_holders', 1))
-        token_df['trust_whale_interaction'] = token_df.get('trust_score', 0) * token_df.get('whale_centralization', 0) # Предполагаем 0 если нет
-        token_df['distrust_whale_interaction'] = token_df.get('distrust_score', 0) * token_df.get('dangerous_whale_concentration', 0) # Предполагаем 0 если нет
+        # Используем имена признаков из ноутбука, если они отсутствуют, подставляем 0
+        # Эти признаки могут быть не в финальном списке features, но их наличие проверяется
+        token_df['trust_whale_interaction'] = token_df.get('trust_score', 0) * token_df.get('whale_centralization', 0) 
+        token_df['distrust_whale_interaction'] = token_df.get('distrust_score', 0) * token_df.get('dangerous_whale_concentration', 0) 
 
         # --- Подготовка к предсказанию ---
+        logger.debug("Подготовка данных для предсказания...")
         available_features = [col for col in features if col in token_df.columns]
         missing_features = [col for col in features if col not in token_df.columns]
         
@@ -332,27 +402,34 @@ def predict_memtoken_advanced(token_data):
                 token_df[col] = 0
         
         X_token = token_df[features].fillna(0)
+        logger.debug(f"Форма подготовленных данных: {X_token.shape}")
 
-        # Кодирование категориальных признаков
+        # Кодирование категориальных признаков (как в ноутбуке)
+        logger.debug("Кодирование категориальных признаков...")
         for col in X_token.columns:
             if col in encoders:
                 try:
                     le = encoders[col]
+                    # Обработка неизвестных меток
                     known_vals = set(le.classes_)
-                    # Заменяем неизвестные значения на 'unknown' или на самое частое значение
-                    # Проще и надежнее - заменить на 'unknown' если оно есть, иначе на первое известное
-                    default_val = 'unknown' if 'unknown' in known_vals else le.classes_[0] if len(le.classes_) > 0 else ''
+                    # Используем 'unknown' если оно было в обучении, иначе первый известный класс
+                    default_val = 'unknown' if 'unknown' in known_vals else (le.classes_[0] if len(le.classes_) > 0 else '')
+                    # Применяем преобразование с обработкой неизвестных значений
                     X_token[col] = X_token[col].apply(lambda x: x if str(x) in known_vals else default_val)
                     X_token[col] = le.transform(X_token[col].astype(str))
+                    logger.debug(f"Закодирован признак '{col}'")
                 except Exception as e:
                      logger.error(f"Ошибка кодирования '{col}': {e}. Заполняем 0.")
                      X_token[col] = 0 # Заполнение при ошибке
 
-        # Масштабирование
+        # Масштабирование (как в ноутбуке)
+        logger.debug("Масштабирование данных...")
         X_token_scaled = scaler.transform(X_token)
 
-        # Предсказание
+        # Предсказание (как в ноутбуке)
+        logger.debug("Выполнение предсказания...")
         if model_name == 'Ensemble' and isinstance(model, dict) and ensemble_weights is not None:
+            logger.debug("Используется ансамбль.")
             ensemble_probas = []
             model_names = list(model.keys()) # Получаем имена моделей
             for name in model_names:
@@ -360,6 +437,7 @@ def predict_memtoken_advanced(token_data):
                 try:
                     prob = m.predict_proba(X_token_scaled)[0, 1]
                     ensemble_probas.append(prob)
+                    logger.debug(f"Модель {name} предсказала вероятность: {prob}")
                 except Exception as e:
                     logger.error(f"Ошибка предсказания модели {name}: {e}")
                     ensemble_probas.append(0.5) # Значение по умолчанию при ошибке
@@ -367,13 +445,17 @@ def predict_memtoken_advanced(token_data):
             if ensemble_probas:
                  probability = np.average(ensemble_probas, weights=ensemble_weights)
                  confidence_interval = (np.min(ensemble_probas), np.max(ensemble_probas))
+                 logger.debug(f"Ансамбль: средняя вероятность={probability}, интервал={confidence_interval}")
             else:
                  probability = 0.5
                  confidence_interval = (0.0, 1.0)
         else:
+            logger.debug(f"Используется одиночная модель: {model_name}.")
             try:
                 probability = model.predict_proba(X_token_scaled)[0, 1]
-                confidence_interval = (probability * 0.9, min(probability * 1.1, 1.0))
+                # Простая оценка доверительного интервала
+                confidence_interval = (max(probability * 0.9, 0.0), min(probability * 1.1, 1.0))
+                logger.debug(f"Одиночная модель: вероятность={probability}")
             except Exception as e:
                  logger.error(f"Ошибка предсказания основной модели: {e}")
                  probability = 0.5
@@ -415,20 +497,21 @@ def predict_memtoken_advanced(token_data):
             "confidence_interval": [0.0, 1.0]
         }
 
-# --- Загрузка модели при запуске ---
+# --- Загрузка модели при запуске (адаптирована из ячейки 20 ноутбука) ---
 def load_model():
     """Загружает обученную модель и её компоненты."""
     global model, scaler, encoders, features, model_name, ensemble_weights
     try:
         model_path = 'memtoken_model_improved.pkl'
         scaler_path = 'memtoken_scaler_improved.pkl'
-        encoders_path = 'memtoken_encoders_improved.pkl'
+        encoders_path = 'memtoken_encoders_improved.pkl' # Имя файла из ноутбука
         features_path = 'memtoken_features_improved.pkl'
         metadata_path = 'memtoken_model_metadata.json'
         ensemble_weights_path = 'memtoken_ensemble_weights.pkl'
 
         logger.info("Начинаем загрузку модели...")
         
+        # Проверяем существование файлов
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Файл модели {model_path} не найден.")
         if not os.path.exists(scaler_path):
@@ -443,19 +526,20 @@ def load_model():
         logger.info(f"Файл энкодеров найден. Размер: {os.path.getsize(encoders_path)} байт")
         logger.info(f"Файл признаков найден. Размер: {os.path.getsize(features_path)} байт")
 
+        # Загружаем компоненты
         model = joblib.load(model_path)
         logger.info("Модель загружена.")
         
         scaler = joblib.load(scaler_path)
         logger.info("Скейлер загружен.")
         
-        encoders = joblib.load(encoders_path)
+        encoders = joblib.load(encoders_path) # Это словарь LabelEncoder'ов
         logger.info("Энкодеры загружены.")
         
-        features = joblib.load(features_path)
+        features = joblib.load(features_path) # Это список названий признаков
         logger.info(f"Признаки загружены. Количество: {len(features) if features else 'N/A'}")
         
-        # Определяем тип модели
+        # Определяем тип модели из метаданных
         if os.path.exists(metadata_path):
              import json
              with open(metadata_path, 'r') as f:
@@ -495,20 +579,36 @@ def predict():
     try:
         # Получаем JSON данные из запроса
         data = request.get_json()
+        logger.debug(f"Получен JSON: {data}")
 
         if not data:
             return jsonify({"error": "JSON данные не предоставлены"}), 400
 
-        # Проверка на наличие ключа 'symbol' или других обязательных полей может быть добавлена
-        # Предполагаем, что data - это словарь с данными одного токена
-        # или список с одним элементом
-        
+        # Обработка входящего формата: [{"body": "JSON-строка"}]
         if isinstance(data, list) and len(data) > 0:
-             token_data = data[0] # Берем первый токен из списка
+            # Проверяем, есть ли поле 'body' с JSON-строкой
+            if 'body' in data[0]:
+                try:
+                    # Парсим JSON из строки body
+                    token_data = json.loads(data[0]['body'])
+                    logger.debug(f"Распарсенные данные из body: {token_data}")
+                except json.JSONDecodeError as e:
+                    return jsonify({"error": f"Ошибка парсинга JSON из поля body: {str(e)}"}), 400
+            else:
+                # Если нет поля body, берем весь объект
+                token_data = data[0]
         elif isinstance(data, dict):
-             token_data = data
+            # Если data - это объект, проверяем наличие поля body
+            if 'body' in data:
+                try:
+                    token_data = json.loads(data['body'])
+                    logger.debug(f"Распарсенные данные из body: {token_data}")
+                except json.JSONDecodeError as e:
+                    return jsonify({"error": f"Ошибка парсинга JSON из поля body: {str(e)}"}), 400
+            else:
+                token_data = data
         else:
-             return jsonify({"error": "Неверный формат данных. Ожидается JSON объект или массив с объектом."}), 400
+            return jsonify({"error": "Неверный формат данных. Ожидается JSON объект или массив с объектом."}), 400
 
         # --- Форматирование входных данных под ожидаемый формат функции ---
         # Преобразуем вложенные объекты в плоские поля
@@ -546,8 +646,14 @@ def predict():
             formatted_data['security_dev_sold'] = int(sec.get('dev_sold', False))
             formatted_data['security_dex_paid'] = int(sec.get('dex_paid', False))
 
+        logger.info(f"Обрабатываем токен: {formatted_data.get('symbol', 'Unknown')} с market_cap: {formatted_data.get('market_cap', 'N/A')}")
+
         # --- Вызов функции предсказания ---
         result = predict_memtoken_advanced(formatted_data)
+
+        # Добавляем информацию о токене в ответ
+        result['token_symbol'] = formatted_data.get('symbol', 'Unknown')
+        result['token_name'] = formatted_data.get('name', 'Unknown')
 
         return jsonify(result)
 
@@ -563,8 +669,8 @@ if __name__ == '__main__':
     # Загружаем модель один раз при старте
     load_model()
     
-    # Получаем порт из переменной окружения (Railway) или используем 5000 по умолчанию
+    # Получаем порт из переменной окружения Railway или используем 5000 по умолчанию
     port = int(os.environ.get('PORT', 5000))
     
     # Запуск Flask приложения
-    app.run(host='0.0.0.0', port=port, debug=False) # debug=False для продакшена
+    app.run(host='0.0.0.0', port=port, debug=False)
