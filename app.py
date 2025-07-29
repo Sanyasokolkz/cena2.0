@@ -1,15 +1,17 @@
+# app.py
 import os
 import pandas as pd
 import numpy as np
 import re
 import joblib
+import json # Для парсинга 'body'
 import logging
-import json
 from flask import Flask, request, jsonify
 from datetime import datetime
 # from sklearn.preprocessing import LabelEncoder # Не импортируем, так как используем сохраненный
 
 # --- Настройка логгирования ---
+# Уровень INFO для Railway, чтобы видеть важные сообщения в логах
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -28,20 +30,21 @@ ensemble_weights = None
 
 def parse_string_number(value):
     """Улучшенная версия парсинга строковых чисел"""
-    # Преобразование массивов/серий в скаляр
+    # Преобразование массивов/серий в скаляр для надежности
     if isinstance(value, (list, np.ndarray, pd.Series)):
         if len(value) == 0:
-            value = '' # Если пустой, считаем как пустую строку
+            value = '' 
         else:
-            # Берем первый элемент. Для Series используем iloc.
             value = value[0] if not isinstance(value, pd.Series) else (value.iloc[0] if len(value) > 0 else '')
+    # Проверка на NaN, None, пустые строки
     if pd.isna(value) or value == '' or value == 'N/A' or value is None:
         return 0.0
+    # Если уже число, возвращаем его
     if isinstance(value, (int, float)):
         return float(value)
+    # Преобразуем в строку и очищаем
     value = str(value).upper().replace(',', '').strip()
-    # Убираем символы валют и лишние символы
-    value = re.sub(r'[^\d\.\-KMBkmb]', '', value)
+    value = re.sub(r'[^\d\.\-KMBkmb]', '', value) # Убираем символы валют и лишние символы
     if value == '' or value == '-':
         return 0.0
     try:
@@ -59,10 +62,10 @@ def parse_string_number(value):
 
 def parse_time_to_minutes(value):
     """Улучшенная версия парсинга времени"""
-    # Преобразование массивов/серий в скаляр
+     # Преобразование массивов/серий в скаляр для надежности
     if isinstance(value, (list, np.ndarray, pd.Series)):
         if len(value) == 0:
-            value = '' # Если пустой, считаем как пустую строку
+            value = '' 
         else:
             value = value[0] if not isinstance(value, pd.Series) else (value.iloc[0] if len(value) > 0 else '')
     if pd.isna(value) or value == '' or value == 'N/A' or value is None:
@@ -88,7 +91,7 @@ def parse_time_to_minutes(value):
         seconds = re.findall(r'(\d+(?:\.\d+)?)s', value)
         if seconds:
             total_minutes += float(seconds[0]) / 60
-        # Если ничего не найдено
+        # Если ничего не найдено, пробуем интерпретировать как число минут
         if total_minutes == 0:
             clean_value = re.sub(r'[^\d\.]', '', value)
             if clean_value:
@@ -98,26 +101,21 @@ def parse_time_to_minutes(value):
          logger.warning(f"Ошибка парсинга времени '{value}': {e}")
          return 0.0
 
-# --- Исправленная функция parse_top10_holdings ---
 def parse_top10_holdings(value, total_top10_percent=None):
     """Улучшенная версия обработки концентрации китов с дополнительными метриками"""
     # --- Исправление: Преобразование value в скаляр ---
-    # Проверяем, является ли value массивом или Series, и извлекаем первый элемент, если возможно
     if isinstance(value, (list, np.ndarray, pd.Series)):
         if len(value) == 0:
-             value_scalar = '' # Если пустой, считаем как пустую строку
+             value_scalar = '' 
         else:
-             # Берем первый элемент. Можно также использовать value.iloc[0] для Series.
-             # Важно: если value - это Series с индексом, iloc[0] безопаснее.
              value_scalar = value[0] if not isinstance(value, pd.Series) else (value.iloc[0] if len(value) > 0 else '')
-    elif pd.isna(value) or value is None: # Проверка на pd.isna и None до str()
-         value_scalar = '' # Считаем NaN или None как пустую строку
+    elif pd.isna(value) or value is None: 
+         value_scalar = '' 
     else:
-         # Если это скаляр (строка, число), преобразуем в строку
          value_scalar = str(value) 
 
-    # Теперь value_scalar точно скаляр. Проверяем его.
-    if value_scalar == '' or value_scalar == 'N/A' or value_scalar == 'nan':
+    # Проверка скалярного значения
+    if value_scalar == '' or value_scalar == 'N/A' or value_scalar.lower() == 'nan':
         return {
             'top1_real_percent': 0.0, 'top3_real_percent': 0.0, 'top5_real_percent': 0.0,
             'concentration_ratio': 0.0, 'internal_distribution': [0.0]*10,
@@ -127,7 +125,7 @@ def parse_top10_holdings(value, total_top10_percent=None):
     
     try:
         # Обработка как строки
-        value_clean = value_scalar.strip('[]').replace(' ', '') # Используем value_scalar
+        value_clean = value_scalar.strip('[]').replace(' ', '') 
         if value_clean:
             # Фильтруем пустые и 'nan' значения
             internal_percentages = [float(x) for x in value_clean.split(',') if x.strip() and x.strip().lower() != 'nan']
@@ -163,7 +161,6 @@ def parse_top10_holdings(value, total_top10_percent=None):
         n = len(sorted_percentages)
         if n > 1:
             cumsum = np.cumsum(sorted_percentages)
-            # Проверка деления на ноль
             total_sorted_sum = sum(sorted_percentages)
             if total_sorted_sum > 0:
                 gini_coefficient = (n + 1 - 2 * sum((n + 1 - i) * x for i, x in enumerate(cumsum))) / (n * total_sorted_sum)
@@ -195,7 +192,6 @@ def parse_top10_holdings(value, total_top10_percent=None):
             'concentration_ratio': 0.0, 'internal_distribution': [0.0]*10,
             'gini_coefficient': 0.0, 'herfindahl_index': 0.0
         }
-# --- Конец исправленной функции ---
 
 # --- Функция предсказания (адаптирована из ячейки 18 ноутбука) ---
 def predict_memtoken_advanced(token_data):
@@ -230,10 +226,7 @@ def predict_memtoken_advanced(token_data):
             if col in token_df.columns:
                 logger.debug(f"Обработка столбца '{col}'")
                 token_df[col] = token_df[col].apply(parse_string_number)
-                # Используем фиксированные значения из обучающего датасета data, если они были сохранены
-                # В API мы просто копируем обработанное значение, так как у нас нет data
-                # В реальном применении можно сохранить q99 при обучении
-                # В ноутбуке использовалось q99 из обучающего сета, здесь просто копируем
+                # В API мы просто копируем обработанное значение
                 token_df[f'{col}_capped'] = token_df[col] 
 
         if 'token_age' in token_df.columns:
@@ -250,9 +243,9 @@ def predict_memtoken_advanced(token_data):
 
         if 'top_10_holdings' in token_df.columns:
              logger.debug("Обработка столбца 'top_10_holdings'")
-             # top_10_percent не всегда нужен, если он есть, используем
-             top10_total = token_data.get('top_10_percent', None) # Получаем из исходных данных
-             holdings_str = token_data.get('top_10_holdings', '') # Получаем из исходных данных
+             # Получаем данные для parse_top10_holdings
+             top10_total = token_data.get('top_10_percent', None) 
+             holdings_str = token_data.get('top_10_holdings', '') 
              metrics = parse_top10_holdings(holdings_str, top10_total)
              token_df['biggest_whale_percent'] = metrics['top1_real_percent']
              token_df['top3_whales_percent'] = metrics['top3_real_percent']
@@ -297,7 +290,6 @@ def predict_memtoken_advanced(token_data):
                                         token_df['sells_5m'] / token_df['sells_1m'], 0)
 
         # Поведенческие паттерны (предполагаем, что данные приходят в "плоском" виде)
-        # Если они приходят во вложенном виде, это обрабатывается в /predict
         logger.debug("Создание поведенческих признаков...")
         token_df['total_holders_emoji'] = (token_df.get('buyers_green', 0) + token_df.get('buyers_blue', 0) + 
                                          token_df.get('buyers_yellow', 0) + token_df.get('buyers_red', 0))
@@ -387,7 +379,6 @@ def predict_memtoken_advanced(token_data):
         token_df['age_volume_interaction'] = token_df.get('token_age_log', 0) * token_df['total_volume_5m']
         token_df['age_holders_interaction'] = token_df.get('token_age_log', 0) * np.log1p(token_df.get('total_holders', 1))
         # Используем имена признаков из ноутбука, если они отсутствуют, подставляем 0
-        # Эти признаки могут быть не в финальном списке features, но их наличие проверяется
         token_df['trust_whale_interaction'] = token_df.get('trust_score', 0) * token_df.get('whale_centralization', 0) 
         token_df['distrust_whale_interaction'] = token_df.get('distrust_score', 0) * token_df.get('dangerous_whale_concentration', 0) 
 
@@ -431,7 +422,7 @@ def predict_memtoken_advanced(token_data):
         if model_name == 'Ensemble' and isinstance(model, dict) and ensemble_weights is not None:
             logger.debug("Используется ансамбль.")
             ensemble_probas = []
-            model_names = list(model.keys()) # Получаем имена моделей
+            model_names = list(model.keys()) 
             for name in model_names:
                 m = model[name]
                 try:
@@ -440,7 +431,7 @@ def predict_memtoken_advanced(token_data):
                     logger.debug(f"Модель {name} предсказала вероятность: {prob}")
                 except Exception as e:
                     logger.error(f"Ошибка предсказания модели {name}: {e}")
-                    ensemble_probas.append(0.5) # Значение по умолчанию при ошибке
+                    ensemble_probas.append(0.5) 
             
             if ensemble_probas:
                  probability = np.average(ensemble_probas, weights=ensemble_weights)
@@ -478,13 +469,21 @@ def predict_memtoken_advanced(token_data):
         else:
             recommendation = "🚫 STRONG AVOID - Крайне низкие шансы"
 
-        return {
+        # Добавляем информацию о токене для удобства
+        result = {
             "success": True,
             "probability": float(probability),
-            "prediction": prediction, # 1 - успешный, 0 - неуспешный
+            "prediction": prediction, 
             "recommendation": recommendation,
             "confidence_interval": [float(confidence_interval[0]), float(confidence_interval[1])]
         }
+        # Добавляем символ и имя токена, если они есть
+        if 'symbol' in token_data:
+            result['token_symbol'] = token_data['symbol']
+        if 'name' in token_data:
+            result['token_name'] = token_data['name']
+
+        return result
 
     except Exception as e:
         logger.error(f"Ошибка в predict_memtoken_advanced: {str(e)}", exc_info=True)
@@ -502,9 +501,10 @@ def load_model():
     """Загружает обученную модель и её компоненты."""
     global model, scaler, encoders, features, model_name, ensemble_weights
     try:
+        # Имена файлов модели (должны совпадать с именами файлов, которые вы загружаете на Railway)
         model_path = 'memtoken_model_improved.pkl'
         scaler_path = 'memtoken_scaler_improved.pkl'
-        encoders_path = 'memtoken_encoders_improved.pkl' # Имя файла из ноутбука
+        encoders_path = 'memtoken_encoders_improved.pkl' 
         features_path = 'memtoken_features_improved.pkl'
         metadata_path = 'memtoken_model_metadata.json'
         ensemble_weights_path = 'memtoken_ensemble_weights.pkl'
@@ -533,15 +533,14 @@ def load_model():
         scaler = joblib.load(scaler_path)
         logger.info("Скейлер загружен.")
         
-        encoders = joblib.load(encoders_path) # Это словарь LabelEncoder'ов
+        encoders = joblib.load(encoders_path) 
         logger.info("Энкодеры загружены.")
         
-        features = joblib.load(features_path) # Это список названий признаков
+        features = joblib.load(features_path) 
         logger.info(f"Признаки загружены. Количество: {len(features) if features else 'N/A'}")
         
         # Определяем тип модели из метаданных
         if os.path.exists(metadata_path):
-             import json
              with open(metadata_path, 'r') as f:
                  metadata = json.load(f)
              model_name = metadata.get('best_model_name', 'Unknown')
@@ -560,8 +559,8 @@ def load_model():
 
     except Exception as e:
         logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА загрузки модели: {e}", exc_info=True)
-        # Можно завершить работу приложения или продолжить с ошибкой
-        # raise e # Раскомментируйте, если хотите, чтобы приложение не запускалось при ошибке загрузки
+        # На Railway это приведет к тому, что приложение не сможет обрабатывать запросы,
+        # но логи будут содержать сообщение об ошибке.
 
 # --- Маршруты Flask ---
 
@@ -577,38 +576,35 @@ def home():
 def predict():
     """Endpoint для получения предсказания."""
     try:
-        # Получаем JSON данные из запроса
-        data = request.get_json()
-        logger.debug(f"Получен JSON: {data}")
+        # Получаем сырые JSON данные из запроса
+        raw_data = request.get_json()
+        logger.debug(f"Получен сырые JSON: {raw_data}")
+
+        # --- Адаптация для структуры входящих данных с "body" ---
+        # Проверка и извлечение данных из "body", если они там
+        if isinstance(raw_data, dict) and 'body' in raw_data:
+            try:
+                # Предполагаем, что 'body' - это JSON строка
+                data = json.loads(raw_data['body'])
+                logger.debug(f"Извлечены данные из 'body': {data}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Ошибка декодирования JSON из 'body': {e}")
+                return jsonify({"error": "Неверный формат JSON в поле 'body'"}), 400
+        else:
+            # Предполагаем, что данные пришли напрямую
+            data = raw_data
+        # --- Конец адаптации ---
 
         if not data:
             return jsonify({"error": "JSON данные не предоставлены"}), 400
 
-        # Обработка входящего формата: [{"body": "JSON-строка"}]
+        # Обработка входных данных (список или словарь)
         if isinstance(data, list) and len(data) > 0:
-            # Проверяем, есть ли поле 'body' с JSON-строкой
-            if 'body' in data[0]:
-                try:
-                    # Парсим JSON из строки body
-                    token_data = json.loads(data[0]['body'])
-                    logger.debug(f"Распарсенные данные из body: {token_data}")
-                except json.JSONDecodeError as e:
-                    return jsonify({"error": f"Ошибка парсинга JSON из поля body: {str(e)}"}), 400
-            else:
-                # Если нет поля body, берем весь объект
-                token_data = data[0]
+             token_data = data[0] # Берем первый токен из списка
         elif isinstance(data, dict):
-            # Если data - это объект, проверяем наличие поля body
-            if 'body' in data:
-                try:
-                    token_data = json.loads(data['body'])
-                    logger.debug(f"Распарсенные данные из body: {token_data}")
-                except json.JSONDecodeError as e:
-                    return jsonify({"error": f"Ошибка парсинга JSON из поля body: {str(e)}"}), 400
-            else:
-                token_data = data
+             token_data = data
         else:
-            return jsonify({"error": "Неверный формат данных. Ожидается JSON объект или массив с объектом."}), 400
+             return jsonify({"error": "Неверный формат данных. Ожидается JSON объект или массив с объектом."}), 400
 
         # --- Форматирование входных данных под ожидаемый формат функции ---
         # Преобразуем вложенные объекты в плоские поля
@@ -646,14 +642,8 @@ def predict():
             formatted_data['security_dev_sold'] = int(sec.get('dev_sold', False))
             formatted_data['security_dex_paid'] = int(sec.get('dex_paid', False))
 
-        logger.info(f"Обрабатываем токен: {formatted_data.get('symbol', 'Unknown')} с market_cap: {formatted_data.get('market_cap', 'N/A')}")
-
         # --- Вызов функции предсказания ---
         result = predict_memtoken_advanced(formatted_data)
-
-        # Добавляем информацию о токене в ответ
-        result['token_symbol'] = formatted_data.get('symbol', 'Unknown')
-        result['token_name'] = formatted_data.get('name', 'Unknown')
 
         return jsonify(result)
 
@@ -669,8 +659,9 @@ if __name__ == '__main__':
     # Загружаем модель один раз при старте
     load_model()
     
-    # Получаем порт из переменной окружения Railway или используем 5000 по умолчанию
+    # Получаем порт из переменной окружения (Railway) или используем 5000 по умолчанию
     port = int(os.environ.get('PORT', 5000))
     
-    # Запуск Flask приложения
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Запуск Flask приложения (на Railway будет использоваться Gunicorn)
+    # host='0.0.0.0' необходимо для Railway
+    app.run(host='0.0.0.0', port=port, debug=False) 
