@@ -7,4 +7,4 @@ catboost==1.2.8
 imbalanced-learn
 joblib==1.5.1
 flask==3.0.0
-gunicorn==21.2.0
+gunicorn
